@@ -296,6 +296,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         triage.target = self
         menu.addItem(triage)
 
+        let pin = NSMenuItem(title: "📌  截图并固定…", action: #selector(startPinCapture), keyEquivalent: "a")
+        pin.keyEquivalentModifierMask = [.option, .command]
+        pin.target = self
+        menu.addItem(pin)
+
+        let pinnedCount = PinnedImageManager.shared.count
+        if pinnedCount > 0 {
+            let closePins = NSMenuItem(
+                title: "关闭全部固定图片（\(pinnedCount) 张）",
+                action: #selector(closeAllPins), keyEquivalent: "")
+            closePins.target = self
+            menu.addItem(closePins)
+        }
+
         menu.addItem(.separator())
 
         addRecents(to: menu)
@@ -499,8 +513,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             GlobalHotKey(keyCode: Key.t, modifiers: Key.cmdOption) { [weak self] in self?.openTodayNote() },
             GlobalHotKey(keyCode: Key.g, modifiers: Key.cmdOption) { [weak self] in self?.openTriage() },
             GlobalHotKey(keyCode: Key.b, modifiers: Key.cmdOption) { [weak self] in self?.toggleFloatingBall() },
+            GlobalHotKey(keyCode: Key.a, modifiers: Key.cmdOption) { [weak self] in self?.startPinCapture() },
         ].compactMap { $0 }
-        Self.log("[hotkey] 已注册 \(hotKeys.count)/9 个全局热键")
+        Self.log("[hotkey] 已注册 \(hotKeys.count)/10 个全局热键")
     }
 
     // MARK: - 动作
@@ -629,6 +644,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.openTodayNote()
             }
             Self.log("[capture] 已静默存入 \(id)，当前 \(count) 条")
+        }
+    }
+
+    // MARK: - 截图固定
+
+    /// ⌥⌘A：框选一块屏幕区域并把它钉在屏幕上
+    @objc private func startPinCapture() {
+        guard !CaptureOverlay.shared.isActive else { return }
+
+        guard ScreenCapture.hasPermission else {
+            promptScreenRecording()
+            return
+        }
+
+        CaptureOverlay.shared.begin { [weak self] cocoaRect in
+            guard let self else { return }
+            guard let cocoaRect else {
+                Self.log("[pin] 用户取消")
+                return
+            }
+
+            let cgRect = ScreenCapture.screenPointRect(fromCocoa: cocoaRect)
+            Self.log(String(format: "[pin] 框选 %.0f×%.0f pt → 屏幕坐标 (%.0f, %.0f)",
+                            cocoaRect.width, cocoaRect.height, cgRect.origin.x, cgRect.origin.y))
+
+            // 遮罩刚关掉，等一帧再截，否则可能把遮罩自己拍进去
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+                ScreenCapture.capture(rect: cgRect) { image in
+                    guard let image else {
+                        CaptureToast.shared.show("截取失败 · 请检查屏幕录制权限", accent: .systemRed)
+                        Self.log("[pin] 截取失败")
+                        return
+                    }
+                    // 位图是物理像素（Retina 上是 2 倍）。这里按「屏幕点」尺寸建 NSImage，
+                    // 显示出来才是原本的视觉大小，而不是被放大一倍。
+                    let nsImage = NSImage(cgImage: image, size: cocoaRect.size)
+                    PinnedImageManager.shared.pin(nsImage, sourceRect: cocoaRect)
+                    Self.log("[pin] 已固定 \(image.width)×\(image.height) 像素 "
+                           + "（\(Int(cocoaRect.width))×\(Int(cocoaRect.height)) pt）")
+                }
+            }
+        }
+    }
+
+    @objc private func closeAllPins() {
+        PinnedImageManager.shared.closeAll()
+        Self.log("[pin] 已关闭全部固定图片")
+    }
+
+    private func promptScreenRecording() {
+        let alert = NSAlert()
+        alert.messageText = "需要「屏幕录制」权限才能截图"
+        alert.informativeText = """
+        悬浮笔记要截取屏幕内容，需要这项系统权限。
+
+        点「打开系统设置」后，在「隐私与安全性 › 屏幕录制」里勾选「悬浮笔记」。
+        授权后如果还不生效，重启一次 App 即可。
+        """
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "稍后")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            ScreenCapture.requestPermission()
+            ScreenCapture.openPrivacySettings()
         }
     }
 
@@ -2089,10 +2168,221 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             PasteboardSnapshot.restore(savedClipboard)
                             Self.log("[pboard] 已还原剪贴板 \(savedClipboard.count) 项")
 
-                            self.finish(ok: self.problems.isEmpty,
-                                        reason: self.problems.joined(separator: "; "))
+                            self.stage19()
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // MARK: 截图固定检查
+
+    /// 统计图片里「蓝紫渐变」像素的占比 —— 用来确认截到的确实是悬浮球
+    private func bluePurpleRatio(_ image: CGImage) -> Double {
+        let w = image.width, h = image.height
+        guard w > 0, h > 0 else { return 0 }
+        var buf = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return 0 }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var hit = 0, total = 0
+        for i in stride(from: 0, to: buf.count, by: 4) {
+            total += 1
+            let r = Double(buf[i]), g = Double(buf[i + 1]), b = Double(buf[i + 2])
+            if b > 180 && b > g + 40 && r < b { hit += 1 }
+        }
+        return total > 0 ? Double(hit) / Double(total) * 100 : 0
+    }
+
+    private func stage19() {
+        guard !finished else { return }
+        Self.log("[selftest] 阶段19 · 截图固定")
+
+        // A. 权限
+        let permitted = ScreenCapture.hasPermission
+        Self.log("[selftest] 屏幕录制权限 = \(permitted)")
+        if !permitted {
+            Self.log("[selftest] 没有权限，跳过实际截取（这不算失败，但功能不可用）")
+            finish(ok: problems.isEmpty, reason: problems.joined(separator: "; ")); return
+        }
+
+        // B. 框选遮罩能不能正常起来
+        CaptureOverlay.shared.begin { _ in }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.stage19Overlay()
+        }
+    }
+
+    private func stage19Overlay() {
+        guard !finished else { return }
+        let active = CaptureOverlay.shared.isActive
+        Self.log("[selftest] 框选遮罩可见 = \(active)")
+        if !active { problems.append("框选遮罩没有显示出来") }
+        CaptureOverlay.shared.cancel()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.stage19Capture()
+        }
+    }
+
+    /// C. 截取 —— 拿悬浮球当参照物：它位置已知、颜色又很好认，
+    ///    正好用来验证「Cocoa 坐标 → 屏幕点坐标」这步换算对不对。
+    private func stage19Capture() {
+        guard !finished else { return }
+        guard let ball = ballPanel, ball.isVisible else {
+            problems.append("悬浮球不可见，无法验证截取坐标系")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+
+        let cocoa = ball.frame
+        let cgRect = ScreenCapture.screenPointRect(fromCocoa: cocoa)
+        Self.log(String(format: "[selftest] 悬浮球 Cocoa(%.0f,%.0f %.0f×%.0f) → 屏幕坐标(%.0f,%.0f)",
+                        cocoa.origin.x, cocoa.origin.y, cocoa.width, cocoa.height,
+                        cgRect.origin.x, cgRect.origin.y))
+
+        ScreenCapture.capture(rect: cgRect) { [weak self] image in
+            guard let self else { return }
+            guard let image else {
+                self.problems.append("截取返回空图（权限可能没真正生效）")
+                self.finish(ok: false, reason: self.problems.joined(separator: "; ")); return
+            }
+
+            let scale = NSScreen.main?.backingScaleFactor ?? 2
+            let expectW = Int(cocoa.width * scale), expectH = Int(cocoa.height * scale)
+            Self.log("[selftest] 截取尺寸 = \(image.width)×\(image.height)，期望 \(expectW)×\(expectH)")
+            if abs(image.width - expectW) > 2 || abs(image.height - expectH) > 2 {
+                self.problems.append("截取尺寸不符（\(image.width)×\(image.height)）")
+            }
+
+            let ratio = self.bluePurpleRatio(image)
+            Self.log(String(format: "[selftest] 蓝紫像素占比 = %.1f%%（悬浮球应该很高）", ratio))
+            if ratio < 15 {
+                self.problems.append(String(format: "截到的不是悬浮球（蓝紫仅 %.1f%%），坐标系可能不对", ratio))
+            }
+
+            self.stage19b(image: image, cocoaRect: cocoa)
+        }
+    }
+
+    /// D. 固定成窗口
+    private func stage19b(image: CGImage, cocoaRect: NSRect) {
+        let nsImage = NSImage(cgImage: image, size: cocoaRect.size)
+        let panel = PinnedImageManager.shared.pin(nsImage, sourceRect: cocoaRect)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.stage19c(panel: panel, nsImage: nsImage)
+        }
+    }
+
+    private func stage19c(panel: PinnedImagePanel, nsImage: NSImage) {
+        guard !finished else { return }
+
+        let cb = panel.collectionBehavior
+        let onTop = panel.level.rawValue == NSWindow.Level.floating.rawValue
+        let ok = panel.isVisible && onTop
+            && cb.contains(.canJoinAllSpaces)
+            && cb.contains(.fullScreenAuxiliary)
+        Self.log("[selftest] 固定窗口：可见=\(panel.isVisible) level=\(panel.level.rawValue) "
+               + "跨Space=\(cb.contains(.canJoinAllSpaces)) "
+               + "可浮全屏=\(cb.contains(.fullScreenAuxiliary))")
+        if !ok { problems.append("固定窗口的置顶/跨屏属性不对") }
+
+        // 再钉一张，确认能同时存在多张
+        _ = PinnedImageManager.shared.pin(nsImage, sourceRect: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.stage19d(nsImage: nsImage)
+        }
+    }
+
+    /// E. 多张共存 + 复制到剪贴板
+    private func stage19d(nsImage: NSImage) {
+        guard !finished else { return }
+
+        let n = PinnedImageManager.shared.count
+        Self.log("[selftest] 多张固定：现在共 \(n) 张")
+        if n < 2 { problems.append("无法同时固定多张截图") }
+
+        let saved = PasteboardSnapshot.capture()
+        ScreenCapture.copyToPasteboard(nsImage)
+        let pb = NSPasteboard.general
+        let types = pb.types ?? []
+        let hasImage = types.contains(.tiff) || types.contains(.png)
+        Self.log("[selftest] 复制到剪贴板：含图片类型=\(hasImage) "
+               + "类型=\(types.prefix(4).map(\.rawValue).joined(separator: ","))")
+        if !hasImage { problems.append("截图没有正确写进剪贴板") }
+        PasteboardSnapshot.restore(saved)
+
+        PinnedImageManager.shared.closeAll()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            let left = PinnedImageManager.shared.count
+            Self.log("[selftest] 全部关闭后剩 \(left) 张")
+            if left != 0 { self.problems.append("关闭全部固定图片没清干净") }
+            self.stage19e(nsImage: nsImage)
+        }
+    }
+
+    /// F. 把截图粘进笔记 —— 这是这个功能最终要落地的效果
+    private func stage19e(nsImage: NSImage) {
+        guard !finished else { return }
+
+        guard let panel = NoteWindowManager.shared.panel(for: Self.selftestID),
+              let editor = NoteWindowManager.shared.editor(for: Self.selftestID) else {
+            problems.append("拿不到笔记窗口，无法验证粘贴")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+
+        // 备份剪贴板 —— 这一步会把截图盖上去，跑完必须还回去
+        let savedClipboard = PasteboardSnapshot.capture()
+        // 记下现有附件，跑完只删自己新造的，不碰用户已有的东西
+        let attachmentsBefore = NoteStore.shared.attachmentNames()
+
+        ScreenCapture.copyToPasteboard(nsImage)
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(editor.webView)
+        editor.focusEditor()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            guard let self else { return }
+            NSApp.sendAction(Selector(("paste:")), to: nil, from: nil)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                // 先把实际生成了哪些块打出来，再判断 —— 免得选择器写错就误判功能坏了
+                let js = #"""
+                (() => {
+                  const types = [...document.querySelectorAll('[data-content-type]')]
+                    .map(e => e.getAttribute('data-content-type'));
+                  const imgs = document.querySelectorAll('img').length;
+                  return JSON.stringify({ types, imgs });
+                })()
+                """#
+                editor.evaluate(js) { result in
+                    let raw = (result as? String) ?? "null"
+                    Self.log("[selftest] 粘贴后文档里的块：\(raw)")
+                    let after = NoteStore.shared.attachmentNames()
+
+                    var imageBlocks = 0
+                    if let d = raw.data(using: .utf8),
+                       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                        let types = (o["types"] as? [String]) ?? []
+                        imageBlocks = types.filter { $0 == "image" }.count
+                    }
+                    Self.log("[selftest] 粘进笔记：图片块 \(imageBlocks) 个，"
+                           + "新增附件 \(after.subtracting(attachmentsBefore).count) 个")
+
+                    if imageBlocks < 1 { self.problems.append("截图没有作为图片块粘进笔记") }
+                    if after.subtracting(attachmentsBefore).isEmpty {
+                        self.problems.append("粘贴的图片没有落盘到附件目录")
+                    }
+
+                    // 只清理本次新产生的附件，用户原有的一个都不动
+                    for name in after.subtracting(attachmentsBefore) {
+                        NoteStore.shared.deleteAttachment(name)
+                    }
+                    PasteboardSnapshot.restore(savedClipboard)
+
+                    self.finish(ok: self.problems.isEmpty,
+                                reason: self.problems.joined(separator: "; "))
                 }
             }
         }

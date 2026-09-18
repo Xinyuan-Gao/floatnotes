@@ -278,6 +278,63 @@ function App() {
     return () => document.removeEventListener("mousemove", onMove, true);
   }, []);
 
+  // 粘贴图片时显式插成「内嵌图片」块。
+  //
+  // BlockNote 自带的插入逻辑是按 MIME 逐个块规格匹配，最后一个匹配的赢；
+  // 但它的 checkMIMETypesMatch 对 "*/*" 的处理是要求类型段相等，
+  // 结果什么都匹配不上，退回默认的 "file" 块 —— 用户看到的是个文件附件，
+  // 不是内嵌图片。这里直接接管，保证粘进来就是图。
+  useEffect(() => {
+    const insertImageBlock = (url) => {
+      const block = { type: "image", props: { url } };
+      let ref = null;
+      try {
+        ref = editor.getTextCursorPosition().block;
+      } catch (e) {
+        ref = null;
+      }
+      if (!ref) ref = editor.document[editor.document.length - 1];
+      if (ref) editor.insertBlocks([block], ref, "after");
+      else editor.replaceBlocks(editor.document, [block]);
+    };
+
+    const looksLikeImage = (item, file) => {
+      const t = (item.type || file?.type || "").toLowerCase();
+      if (t.startsWith("image/")) return true;
+      return /\.(png|jpe?g|gif|webp|heic|heif|tiff?|bmp)$/i.test(file?.name || "");
+    };
+
+    const onPaste = async (e) => {
+      const dt = e.clipboardData;
+      if (!dt) return;
+
+      const items = Array.from(dt.items || []);
+      const target = items.find((it) => {
+        if (it.kind !== "file") return false;
+        return looksLikeImage(it, it.getAsFile());
+      });
+      if (!target) return;
+
+      const file = target.getAsFile();
+      if (!file) return;
+
+      log("粘贴图片：" + items.map((it) =>
+        it.kind + ":" + (it.type || "-") + ":" + (it.getAsFile()?.name || "-")
+      ).join(" | "));
+
+      // 抢在 BlockNote 自己的处理之前
+      e.preventDefault();
+      e.stopPropagation();
+
+      const name = await requestUpload(file);
+      if (!name) return;
+      insertImageBlock(`floatnotes://media/${name}`);
+    };
+
+    document.addEventListener("paste", onPaste, true);
+    return () => document.removeEventListener("paste", onPaste, true);
+  }, [editor]);
+
   // 主题覆盖
   useEffect(() => {
     const h = (e) => setThemeMode(e.detail || "auto");

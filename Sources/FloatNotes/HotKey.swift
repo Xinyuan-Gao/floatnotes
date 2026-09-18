@@ -76,6 +76,7 @@ enum Key {
     static let t: UInt32 = UInt32(kVK_ANSI_T)
     static let g: UInt32 = UInt32(kVK_ANSI_G)
     static let b: UInt32 = UInt32(kVK_ANSI_B)
+    static let a: UInt32 = UInt32(kVK_ANSI_A)
 
     static let cmdOption: UInt32 = UInt32(cmdKey | optionKey)
     static let cmdOptionShift: UInt32 = UInt32(cmdKey | optionKey | shiftKey)

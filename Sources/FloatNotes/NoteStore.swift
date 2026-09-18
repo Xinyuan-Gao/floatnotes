@@ -36,6 +36,21 @@ final class NoteStore {
         }
     }
 
+    /// 附件目录里现有的文件名集合（自检用来精确清理自己产生的那几个）
+    func attachmentNames() -> Set<String> {
+        let names = (try? FileManager.default.contentsOfDirectory(
+            at: attachmentsDir, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]))?.map(\.lastPathComponent) ?? []
+        return Set(names)
+    }
+
+    /// 附件目录里现有多少个文件（自检用）
+    func attachmentCount() -> Int {
+        (try? FileManager.default.contentsOfDirectory(
+            at: attachmentsDir, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]))?.count ?? 0
+    }
+
     /// 删除一个附件文件（自检清理用）
     func deleteAttachment(_ filename: String) {
         let target = attachmentsDir.appendingPathComponent(filename).standardizedFileURL
