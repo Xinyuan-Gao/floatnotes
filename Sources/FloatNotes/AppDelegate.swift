@@ -39,6 +39,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exit(0)
         }
 
+        // --dom-probe：打印编辑器命中测试结果，用来确定「空白处」怎么判定
+        if CommandLine.arguments.contains("--dom-probe") {
+            runDOMProbe()
+            return
+        }
+
         // --screenshot <png路径>：渲染一张「笔记窗口」示意图，给 README 用。
         // 用 WKWebView 自己渲染 + 合成窗口外框，避免依赖屏幕录制权限。
         if let i = CommandLine.arguments.firstIndex(of: "--screenshot"),
@@ -70,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         startWatchingNotes()
+        installContentDragMonitor()
 
         Self.log("""
         ─────────────────────────────────────────────
@@ -763,6 +770,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(NoteStore.shared.root)
     }
 
+    // MARK: - DOM 探针
+
+    private func runDOMProbe() {
+        let size = NSSize(width: 560, height: 620)
+        let panel = NotePanel(noteID: "DOM探针", frame: NSRect(origin: .zero, size: size))
+        let editor = WebEditorView(frame: NSRect(origin: .zero, size: size))
+        editor.setFontSize(15)
+        editor.onReady = { editor.load(markdown: Self.screenshotMarkdown) }
+        panel.contentView = editor
+        panel.orderFrontRegardless()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            // 用 Swift 原始字符串 #"""..."""#，里面的 \n \s 都原样传给 JS，
+            // 否则 Swift 会先把它当自己的转义处理，\s 直接报 invalid escape sequence
+            let js = #"""
+            (() => {
+              const ed = document.querySelector('.bn-editor');
+              if (!ed) return 'no .bn-editor found';
+              const r = ed.getBoundingClientRect();
+              const describe = (el) => {
+                const out = [];
+                let cur = el;
+                for (let i = 0; i < 4 && cur && cur.tagName; i++) {
+                  const cls = (typeof cur.className === 'string' && cur.className)
+                    ? '.' + cur.className.trim().split(' ').slice(0, 2).join('.') : '';
+                  out.push(cur.tagName.toLowerCase() + cls);
+                  cur = cur.parentElement;
+                }
+                return out.join(' < ');
+              };
+              const pts = [
+                ['左上内边距',   r.left + 6,           r.top + 6],
+                ['右内边距中部', r.right - 6,          r.top + r.height * 0.4],
+                ['底部内边距',   r.left + r.width / 2, r.bottom - 10],
+                ['正文行上',     r.left + r.width / 2, r.top + 45],
+                ['正文下方空区', r.left + r.width / 2, r.top + r.height * 0.78],
+                ['标题上方',     r.left + r.width / 2, r.top + 12],
+              ];
+              const rows = pts.map(([name, x, y]) => {
+                const el = document.elementFromPoint(x, y);
+                return name + ' → ' + (el ? describe(el) : 'null');
+              });
+              const blocks = [...document.querySelectorAll('.bn-block-outer')].map(b => {
+                const br = b.getBoundingClientRect();
+                return '  block y=' + Math.round(br.top) + '..' + Math.round(br.bottom);
+              });
+              return 'editor rect t=' + Math.round(r.top) + ' b=' + Math.round(r.bottom)
+                + ' l=' + Math.round(r.left) + ' r=' + Math.round(r.right)
+                + ' h=' + Math.round(r.height)
+                + '\n' + rows.join('\n') + '\n' + blocks.join('\n')
+                + '\nviewport h=' + window.innerHeight;
+            })()
+            """#
+            editor.evaluate(js) { result in
+                Self.log("[dom-probe]\n\(result ?? "无返回")")
+                exit(0)
+            }
+        }
+    }
+
     // MARK: - 截图模式
 
     private static let screenshotMarkdown = """
@@ -892,6 +959,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         out.unlockFocus()
         return out
+    }
+
+    // MARK: - 按住内容区空白拖动窗口
+    //
+    // 笔记窗口的内容区是 WKWebView，它会把鼠标事件全部吃掉，
+    // 所以窗口原来只能靠顶部那一条标题栏拖动。
+    // 这里让 JS 上报「指针是否停在编辑区空白处」，再用本地事件监听接管拖动。
+
+    private var dragMonitor: Any?
+    private var contentDrag: (startMouse: NSPoint, startOrigin: NSPoint, panel: NotePanel)?
+    private var contentDragMoved = false
+
+    /// 位移小于这个值当成单击，不吞事件 —— 免得影响正常的点选和放光标
+    static let contentDragThreshold: CGFloat = 3
+
+    private func installContentDragMonitor() {
+        dragMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+        ) { [weak self] event in
+            guard let self, let panel = event.window as? NotePanel else { return event }
+
+            switch event.type {
+            case .leftMouseDown:
+                if NoteWindowManager.shared.isPointerOverBlank(panel) {
+                    self.beginContentDrag(panel: panel)
+                } else {
+                    self.contentDrag = nil
+                }
+                return event          // 不吞：单击仍然能正常聚焦
+
+            case .leftMouseDragged:
+                guard self.contentDrag != nil else { return event }
+                return self.updateContentDrag(to: NSEvent.mouseLocation) ? nil : event
+
+            case .leftMouseUp:
+                self.endContentDrag()
+                return event
+
+            default:
+                return event
+            }
+        }
+    }
+
+    func beginContentDrag(panel: NotePanel, at point: NSPoint? = nil) {
+        contentDrag = (point ?? NSEvent.mouseLocation, panel.frame.origin, panel)
+        contentDragMoved = false
+    }
+
+    /// 回传 true 表示这次拖动已被接管（调用方应把事件吞掉）
+    @discardableResult
+    func updateContentDrag(to point: NSPoint) -> Bool {
+        guard let d = contentDrag else { return false }
+        let dx = point.x - d.startMouse.x
+        let dy = point.y - d.startMouse.y
+
+        if !contentDragMoved {
+            guard abs(dx) > Self.contentDragThreshold || abs(dy) > Self.contentDragThreshold else {
+                return false          // 还没越过阈值，交给 WebView 自己处理
+            }
+            contentDragMoved = true
+        }
+        d.panel.setFrameOrigin(NSPoint(x: d.startOrigin.x + dx,
+                                       y: d.startOrigin.y + dy))
+        return true
+    }
+
+    func endContentDrag() {
+        guard let d = contentDrag else { return }
+        contentDrag = nil
+        contentDragMoved = false
+
+        // 夹回屏幕内（位置会被 windowDidMove 顺手存下来）
+        guard let screen = d.panel.screen ?? NSScreen.main else { return }
+        let v = screen.visibleFrame
+        var f = d.panel.frame
+        let x = min(max(f.origin.x, v.minX), max(v.minX, v.maxX - f.width))
+        let y = min(max(f.origin.y, v.minY), max(v.minY, v.maxY - f.height))
+        if x != f.origin.x || y != f.origin.y {
+            f.origin = NSPoint(x: x, y: y)
+            d.panel.setFrame(f, display: true)
+        }
     }
 
     // MARK: - 自检（M1 全链路）
@@ -1526,7 +1675,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Self.log("[selftest] 删除剩余条目后今日笔记剩 \(finalCount) 条")
         if finalCount != 0 { problems.append("删除未清空（剩 \(finalCount)）") }
 
-        cleanupAllTestNotes()
+        // 注意：这里不能清场 —— 后面的阶段还要用那个笔记窗口。
+        // 清场统一放到 finish() 里，这样失败/超时路径也能清干净。
         stage15()
     }
 
@@ -1673,24 +1823,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 还原位置
             panel.setFrame(originalFrame, display: false)
             UserDefaults.standard.set(NSStringFromRect(originalFrame), forKey: "ballFrame")
-            self.finish(ok: self.problems.isEmpty,
-                        reason: self.problems.joined(separator: "; "))
+            self.stage17()
         }
+    }
+
+    // MARK: 内容区拖动窗口检查
+
+    private func stage17() {
+        guard !finished else { return }
+        Self.log("[selftest] 阶段17 · 按住内容区空白拖动窗口")
+
+        guard let ed = NoteWindowManager.shared.editor(for: Self.selftestID),
+              let panel = NoteWindowManager.shared.panel(for: Self.selftestID) else {
+            problems.append("拿不到笔记窗口")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+
+        // A0. 事件监听有没有真的装上 —— 逻辑对但监听没装上，功能照样是死的
+        Self.log("[selftest] 拖动事件监听已安装 = \(dragMonitor != nil)")
+        if dragMonitor == nil {
+            problems.append("拖动事件监听没有安装成功")
+        }
+
+        // A. 空白判定：JS 侧命中测试
+        let js = #"""
+        (() => {
+          const el = document.querySelector('.tiptap, .ProseMirror, .bn-editor');
+          if (!el) return 'no editor';
+          const r = el.getBoundingClientRect();
+          return JSON.stringify({
+            leftPad:   window.FloatNotes._testBlankAt(r.left + 6, r.top + r.height * 0.5),
+            bottomPad: window.FloatNotes._testBlankAt(r.left + r.width / 2, r.bottom - 8),
+            onText:    window.FloatNotes._testBlankAt(r.left + 30, r.top + 20),
+          });
+        })()
+        """#
+        ed.evaluate(js) { [weak self] result in
+            guard let self else { return }
+            let raw = (result as? String) ?? "null"
+            Self.log("[selftest] 空白判定 = \(raw)")
+
+            if let d = raw.data(using: .utf8),
+               let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                if (o["leftPad"] as? Bool) != true { self.problems.append("左侧内边距没被判定为空白") }
+                if (o["bottomPad"] as? Bool) != true { self.problems.append("底部空区没被判定为空白") }
+                if (o["onText"] as? Bool) != false { self.problems.append("正文文字上被误判为空白") }
+            } else {
+                self.problems.append("空白判定无返回")
+            }
+
+            self.stage17b(panel: panel)
+        }
+    }
+
+    /// B. 拖动位移：绝对值定位 + 起拖阈值
+    private func stage17b(panel: NotePanel) {
+        // ★ 先把窗口摆到屏幕正中再测。否则往「上」拖会撞上
+        //   NSWindow.constrainFrameRect（标题栏不许跑到菜单栏上面），
+        //   实测位移会被系统截短，看起来像 bug 其实是正常的系统行为。
+        if let screen = NSScreen.main {
+            let v = screen.visibleFrame
+            let size = panel.frame.size
+            panel.setFrame(NSRect(x: v.midX - size.width / 2,
+                                  y: v.midY - size.height / 2,
+                                  width: size.width, height: size.height),
+                           display: false)
+        }
+
+        let start = NSPoint(x: 1234, y: 567)
+        let originBefore = panel.frame.origin
+
+        beginContentDrag(panel: panel, at: start)
+
+        // 1px 位移属于单击，不该移动窗口，也不该吞事件
+        let tiny = updateContentDrag(to: NSPoint(x: start.x + 1, y: start.y + 1))
+        let afterTiny = panel.frame.origin
+        Self.log("[selftest] 1px 位移：接管=\(tiny) 窗口位移=(\(afterTiny.x - originBefore.x), \(afterTiny.y - originBefore.y))")
+        if tiny { problems.append("1px 位移就被当成拖动，会误伤点选") }
+        if afterTiny != originBefore { problems.append("1px 位移不该移动窗口") }
+
+        // 越过阈值后应精确跟随（往右下拖，避开系统约束）
+        let took = updateContentDrag(to: NSPoint(x: start.x + 90, y: start.y - 40))
+        let after = panel.frame.origin
+        let dx = after.x - originBefore.x, dy = after.y - originBefore.y
+        Self.log(String(format: "[selftest] 越过阈值后：接管=%@ 位移=(%.0f, %.0f)，期望 (90, -40)",
+                        took ? "是" : "否", dx, dy))
+        if !took { problems.append("越过阈值后没有接管拖动") }
+        if abs(dx - 90) > 2 || abs(dy + 40) > 2 {
+            problems.append(String(format: "窗口位移不对（%.0f, %.0f），期望 (90, -40)", dx, dy))
+        }
+
+        endContentDrag()
+        panel.setFrame(NSRect(origin: originBefore, size: panel.frame.size), display: false)
+
+        finish(ok: problems.isEmpty, reason: problems.joined(separator: "; "))
     }
 
     private func finish(ok: Bool, reason: String) {
         guard !finished else { return }
         finished = true
 
-        // 无论走哪条路（成功 / 断言失败 / 超时）都要把用户设置还原
+        // 无论走哪条路（成功 / 断言失败 / 超时）都要把用户设置还原、把测试笔记删掉
         restoreSettings()
+        cleanupAllTestNotes()
+
+        // ★ 关键：UserDefaults 的写入是异步的，而下面用的是 exit()，
+        //   不走 NSApplication 的正常退出流程。不强制落盘的话，
+        //   还原后的值还没写进磁盘进程就没了，磁盘上会残留测试中途写的值。
+        UserDefaults.standard.synchronize()
 
         Self.log("[selftest] 窗口诊断:\n\(NoteWindowManager.shared.diagnostics())")
         Self.log("[selftest] \(Perf.report(windows: NoteWindowManager.shared.openCount))")
         if !ok { Self.log("[selftest] ✗ 失败原因: \(reason)") }
         Self.log("[selftest] \(ok ? "PASS ✅" : "FAIL ❌")")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(ok ? 0 : 1) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(ok ? 0 : 1) }
     }
 
     static func log(_ msg: String) {

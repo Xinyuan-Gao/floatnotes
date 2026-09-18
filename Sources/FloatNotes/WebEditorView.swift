@@ -22,6 +22,8 @@ final class WebEditorView: NSView {
     var onReady: (() -> Void)?
     var onChange: ((String) -> Void)?
     var onLog: ((String) -> Void)?
+    /// 指针是否停在编辑区的空白处（由 JS 上报）
+    var onBlankHover: ((Bool) -> Void)?
 
     private var isReady = false
     private var pendingLoad: String?
@@ -225,6 +227,9 @@ extension WebEditorView: WKScriptMessageHandler {
 
         case "change":
             onChange?(body["markdown"] as? String ?? "")
+
+        case "blankHover":
+            onBlankHover?(body["blank"] as? Bool ?? false)
 
         case "upload":
             handleUpload(body)

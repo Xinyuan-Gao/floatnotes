@@ -28,6 +28,14 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
     /// 当前置顶层级（由设置决定）
     var currentLevel: PanelLevel { Settings.shared.panelLevel }
 
+    /// 每个笔记窗口里，指针当前是否停在编辑区空白处
+    private var blankHover: [String: Bool] = [:]
+
+    /// 该窗口此刻能不能「按住内容区空白拖动」
+    func isPointerOverBlank(_ panel: NotePanel) -> Bool {
+        blankHover[panel.noteID] ?? false
+    }
+
     /// 当前获得键盘焦点的笔记（菜单里的「当前笔记」操作指向它）
     private(set) var keyNoteID: String?
 
@@ -74,6 +82,9 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
         }
         editor.onChange = { markdown in
             NoteStore.shared.scheduleSave(id, markdown: markdown)
+        }
+        editor.onBlankHover = { [weak self] blank in
+            self?.blankHover[id] = blank
         }
         panel.contentView = editor
         panel.applyAppearance(opacity: Settings.shared.opacity(for: id))

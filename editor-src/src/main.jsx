@@ -17,6 +17,16 @@ const post = (msg) => {
 };
 const log = (text) => post({ type: "log", text });
 
+// 判断某个元素是不是「编辑区的空白处」：
+// 在编辑区之内、但不在任何内容块（.bn-block-content）里。
+// 左右内边距、正文下方的空区都命中编辑器根元素，正好落在这个定义里。
+function isBlankTarget(el) {
+  if (!el || typeof el.closest !== "function") return false;
+  if (!el.closest(".bn-container")) return false;      // 不在编辑区
+  if (el.closest(".bn-block-content")) return false;   // 落在某个块上
+  return true;
+}
+
 const prefersDark = () =>
   window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
 
@@ -182,6 +192,10 @@ function App() {
         const fn = pendingUploads.get(id);
         if (fn) fn(filename);
       },
+      // 自检用：某个坐标点算不算空白
+      _testBlankAt(x, y) {
+        return isBlankTarget(document.elementFromPoint(x, y));
+      },
       // 自检用
       async status() {
         const md = await editor.blocksToMarkdownLossy(editor.document);
@@ -249,6 +263,19 @@ function App() {
     const onChange = (e) => setSystemDark(e.matches);
     mq.addEventListener?.("change", onChange);
     return () => mq.removeEventListener?.("change", onChange);
+  }, []);
+
+  // 告诉 Swift 指针现在是不是停在空白处 —— 决定「按住空白拖动窗口」能不能触发。
+  // 只在状态翻转时发消息，避免每次 mousemove 都过一遍桥。
+  useEffect(() => {
+    let last = null;
+    const report = (blank) => {
+      if (blank !== last) { last = blank; post({ type: "blankHover", blank }); }
+    };
+    const onMove = (e) => report(isBlankTarget(e.target));
+    document.addEventListener("mousemove", onMove, true);
+    document.addEventListener("mouseleave", () => report(false));
+    return () => document.removeEventListener("mousemove", onMove, true);
   }, []);
 
   // 主题覆盖
