@@ -36,8 +36,23 @@ STAMP="$(date +%Y%m%d.%H%M)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $STAMP" "$APP/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $STAMP" "$APP/Contents/Info.plist"
 
-echo "▸ [4/4] ad-hoc 签名"
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 && echo "   签名完成" || echo "   签名跳过（自用无妨）"
+echo "▸ [4/4] 签名"
+SIGN_ID="FloatNotes Local Signing"
+KC="$HOME/Library/Keychains/floatnotes-signing.keychain-db"
+if security find-identity -v -p codesigning "$KC" 2>/dev/null | grep -q "$SIGN_ID"; then
+  security unlock-keychain -p "floatnotes" "$KC" >/dev/null 2>&1 || true
+  if codesign --force --deep -i com.xy.floatnotes --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
+    echo "   已用稳定身份签名（重新构建不会丢屏幕录制授权）"
+  else
+    codesign --force --deep --sign - "$APP" >/dev/null 2>&1 \
+      && echo "   ⚠️ 稳定身份签名失败，回退 ad-hoc（授权可能需重给）" \
+      || echo "   签名跳过"
+  fi
+else
+  codesign --force --deep --sign - "$APP" >/dev/null 2>&1 \
+    && echo "   ad-hoc 签名（跑 tools/setup-signing.sh 可换成稳定身份）" \
+    || echo "   签名跳过"
+fi
 
 echo
 echo "✅ 打包完成：${APP}（构建 ${STAMP}）"
