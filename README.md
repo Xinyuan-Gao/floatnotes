@@ -129,7 +129,11 @@ floatnotes/
 ./build.sh                      # 构建 + 打包 .app
 
 # 全链路自检（无需人工，跑完自动退出，exit 0 = 全部通过）
+# 注意：跑之前先退出正在运行的实例，两个实例共用文档目录会互相干扰
 "./dist/悬浮笔记.app/Contents/MacOS/FloatNotes" --selftest
+
+# 打印编辑器命中测试结果（用于确定「空白处」范围）
+"./dist/悬浮笔记.app/Contents/MacOS/FloatNotes" --dom-probe
 
 # 重新生成图标
 ./tools/make-icon.sh

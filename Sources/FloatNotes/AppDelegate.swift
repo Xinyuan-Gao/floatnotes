@@ -1078,6 +1078,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func runSelfTest() {
         Self.log("[selftest] 开始")
+
+        // 同 bundle id 跑两个实例时，它们共用同一个文档目录和 UserDefaults，
+        // 会互相关闭彼此的窗口、互相触发文件监听。表现是「拿不到编辑器实例」
+        // 这种完全看不出原因的失败 —— 所以先挡掉，给一句能看懂的话。
+        if let bid = Bundle.main.bundleIdentifier {
+            let me = ProcessInfo.processInfo.processIdentifier
+            let others = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+                .filter { $0.processIdentifier != me }
+            if !others.isEmpty {
+                Self.log("[selftest] ✗ 检测到还有 \(others.count) 个悬浮笔记实例在运行"
+                       + "（PID \(others.map { String($0.processIdentifier) }.joined(separator: ", "))）")
+                Self.log("[selftest]   两个实例共用文档目录与偏好设置，会互相干扰。")
+                Self.log("[selftest]   请先退出正在运行的实例，再执行自检。")
+                exit(2)
+            }
+        }
+
         backupSettings()
         baselineMB = Perf.residentMemoryMB()
         Self.log(String(format: "[selftest] 基线内存 %.1f MB", baselineMB))
