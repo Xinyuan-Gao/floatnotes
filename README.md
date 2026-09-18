@@ -140,6 +140,10 @@ floatnotes/
 ## 开发
 
 ```bash
+# 可选但强烈建议：创建稳定的本地签名身份（见下方「关于签名」）
+# 不做的话，每次重新构建后屏幕录制授权都要重给
+./tools/setup-signing.sh
+
 ./build.sh                      # 构建 + 打包 .app
 
 # 全链路自检（无需人工，跑完自动退出，exit 0 = 全部通过）
@@ -160,6 +164,31 @@ floatnotes/
 [selftest] 内存: 5 窗口 | 基线 61.0 MB | 平均 87.3 MB
 [selftest] 归档 2 条 → 自检主题笔记；今日笔记剩 1 条，目标笔记收到 2 条
 ```
+
+### 关于签名
+
+macOS 的屏幕录制授权是按**代码签名**认的。
+
+ad-hoc 签名的 designated requirement 是 `cdhash H"..."`，而 cdhash 随二进制变化——每重新构建一次，系统就当成另一个 App：授权作废，而且系统设置里会留下同名旧记录（显示「已开启」，但对当前版本并不生效，非常误导）。
+
+`tools/setup-signing.sh` 会创建一个自签名证书身份，让 DR 变成：
+
+```
+identifier "com.xy.floatnotes" and certificate root = H"<证书哈希>"
+```
+
+证书和 bundle id 都不变，所以**授权一次就长期有效**。实测两个内容完全不同的二进制，DR 逐字一致。
+
+身份只在你本机创建，仓库里不含任何证书。不想要它就把那个钥匙串删掉，`build.sh` 会自动回退到 ad-hoc。
+
+### 权限排查
+
+如果按了快捷键没反应，先看菜单栏里的「屏幕录制权限」那一项：
+
+- **未授权** → 点它，按提示走一遍
+- **已授权但还是不出框选** → 多半是授权的对象和当前运行的二进制对不上，跑一次 `./tools/setup-signing.sh` 再用 `tccutil reset ScreenCapture com.xy.floatnotes` 清掉旧记录重新授权
+
+> 另有一个排查上的坑：**从终端直接执行 `.app` 里的二进制会继承终端的权限身份**，`CGPreflightScreenCaptureAccess()` 会返回 `true`，让人误以为权限没问题。要确认真实状态，用 `open -n "/Applications/悬浮笔记.app" --args --perm-check /tmp/p.txt`，那个才是 App 自己的判定。
 
 ## 实测数据
 
