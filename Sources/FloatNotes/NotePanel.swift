@@ -123,10 +123,12 @@ final class FloatingBallPanel: NSPanel {
     override var canBecomeKey: Bool { false }   // 悬浮球不需要键盘
     override var canBecomeMain: Bool { false }
 
+    static let ballSize: CGFloat = 52
+
     init(origin: NSPoint) {
-        let size = NSSize(width: 52, height: 52)
         super.init(
-            contentRect: NSRect(origin: origin, size: size),
+            contentRect: NSRect(origin: origin,
+                                size: NSSize(width: Self.ballSize, height: Self.ballSize)),
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
@@ -138,65 +140,102 @@ final class FloatingBallPanel: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
-        isMovableByWindowBackground = true
+        // ★ 必须关掉：AppKit 自带的「拖背景移动窗口」会和下面手写的拖动同时生效，
+        //   两个机制一起移动窗口，手感就是抖的、跟不上的。
+        isMovableByWindowBackground = false
         isReleasedWhenClosed = false
         ignoresMouseEvents = false
     }
 }
 
-/// 悬浮球内容视图：拖动移动窗口（松手自动贴边），轻点弹菜单，双击直接新建笔记。
+/// 悬浮球内容视图。
+///
+/// 拖动全程由这里接管，用**全局鼠标坐标做绝对定位**而不是逐帧累加增量 ——
+/// 增量算法是自引用的（窗口一移动，光标在窗口内的坐标就跟着变），会产生滞后和抖动。
 final class FloatingBallView: NSView {
+
     var onClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
-    private var dragOrigin: NSPoint = .zero
+
+    /// 可注入，便于自检时模拟鼠标轨迹
+    var mouseLocationProvider: () -> NSPoint = { NSEvent.mouseLocation }
+
+    private var dragStartMouse: NSPoint = .zero
+    private var dragStartOrigin: NSPoint = .zero
     private var didDrag = false
+    private(set) var isDragging = false
+
+    /// 靠近屏幕左右边缘多少距离内才磁吸
+    static let snapThreshold: CGFloat = 56
+    /// 吸附后离边缘留多少
+    static let snapMargin: CGFloat = 12
+
+    // MARK: 绘制
 
     override func draw(_ dirtyRect: NSRect) {
-        let inset = bounds.insetBy(dx: 5, dy: 5)
-        let path = NSBezierPath(ovalIn: inset)
+        // 拖动时略微放大，给出「抓住了」的反馈
+        let inset: CGFloat = isDragging ? 2.5 : 5
+        let path = NSBezierPath(ovalIn: bounds.insetBy(dx: inset, dy: inset))
 
-        // 渐变圆
+        let baseAlpha: CGFloat = isDragging ? 1.0 : 0.96
         let gradient = NSGradient(colors: [
-            NSColor(calibratedRed: 0.36, green: 0.44, blue: 0.98, alpha: 0.96),
-            NSColor(calibratedRed: 0.55, green: 0.33, blue: 0.94, alpha: 0.96)
+            NSColor(calibratedRed: 0.36, green: 0.44, blue: 0.98, alpha: baseAlpha),
+            NSColor(calibratedRed: 0.55, green: 0.33, blue: 0.94, alpha: baseAlpha)
         ])
         gradient?.draw(in: path, angle: -90)
 
-        // 白色 "+"
         NSColor.white.setStroke()
         let plus = NSBezierPath()
         let c = NSPoint(x: bounds.midX, y: bounds.midY)
-        let arm: CGFloat = 11
-        plus.lineWidth = 2.6
+        let arm: CGFloat = isDragging ? 12 : 11
+        plus.lineWidth = isDragging ? 2.9 : 2.6
         plus.lineCapStyle = .round
         plus.move(to: NSPoint(x: c.x - arm, y: c.y)); plus.line(to: NSPoint(x: c.x + arm, y: c.y))
         plus.move(to: NSPoint(x: c.x, y: c.y - arm)); plus.line(to: NSPoint(x: c.x, y: c.y + arm))
         plus.stroke()
     }
 
+    // MARK: 拖动
+
+    /// 明确告诉 AppKit：这个视图不该触发「拖背景移动窗口」
+    override var mouseDownCanMoveWindow: Bool { false }
+
     override func mouseDown(with event: NSEvent) {
-        dragOrigin = event.locationInWindow
+        dragStartMouse = mouseLocationProvider()
+        dragStartOrigin = window?.frame.origin ?? .zero
         didDrag = false
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let window = window else { return }
-        if abs(event.locationInWindow.x - dragOrigin.x) > 2
-            || abs(event.locationInWindow.y - dragOrigin.y) > 2 {
+        guard let window else { return }
+
+        let now = mouseLocationProvider()
+        let dx = now.x - dragStartMouse.x
+        let dy = now.y - dragStartMouse.y
+
+        if !didDrag, abs(dx) > 2 || abs(dy) > 2 {
             didDrag = true
+            isDragging = true
+            needsDisplay = true
         }
-        let current = event.locationInWindow
-        var origin = window.frame.origin
-        origin.x += current.x - dragOrigin.x
-        origin.y += current.y - dragOrigin.y
-        window.setFrameOrigin(origin)
+        guard didDrag else { return }
+
+        // 绝对定位：起点 + 总位移。窗口怎么动都不会影响这个计算。
+        window.setFrameOrigin(NSPoint(x: dragStartOrigin.x + dx,
+                                      y: dragStartOrigin.y + dy))
     }
 
     override func mouseUp(with event: NSEvent) {
+        if isDragging {
+            isDragging = false
+            needsDisplay = true
+        }
+
         if didDrag {
-            snapToEdge()
+            finishDrag(animated: true)
             return
         }
+
         if event.clickCount >= 2 {
             onDoubleClick?()
         } else {
@@ -212,37 +251,61 @@ final class FloatingBallView: NSView {
         addCursorRect(bounds, cursor: .pointingHand)
     }
 
-    // MARK: - 贴边吸附
+    // MARK: 落点处理
 
-    /// 松手后吸附到设置里指定的那一侧，并记住纵向位置。
-    private func snapToEdge() {
-        guard let window, let screen = window.screen ?? NSScreen.main else { return }
+    /// 松手后：先保证不跑出屏幕，然后**只在靠近左右边缘时**才磁吸。
+    /// 停在屏幕中间就原地保留 —— 之前是无条件拉回边缘，所以横向根本摆不了。
+    @discardableResult
+    func finishDrag(animated: Bool) -> NSRect? {
+        guard let window, let screen = window.screen ?? NSScreen.main else { return nil }
         let v = screen.visibleFrame
-        let margin: CGFloat = 14
         var f = window.frame
 
-        f.origin.x = Settings.shared.ballEdge == "left"
-            ? v.minX + margin
-            : v.maxX - f.width - margin
+        // 1) 不跑出屏幕
+        let pad: CGFloat = 4
+        f.origin.x = min(max(f.origin.x, v.minX + pad), v.maxX - f.width - pad)
+        f.origin.y = min(max(f.origin.y, v.minY + pad), v.maxY - f.height - pad)
 
-        // 纵向限制在屏幕内
-        f.origin.y = min(max(f.origin.y, v.minY + margin), v.maxY - f.height - margin)
+        // 2) 磁吸
+        let distLeft = f.minX - v.minX
+        let distRight = v.maxX - f.maxX
+        if distLeft < Self.snapThreshold {
+            f.origin.x = v.minX + Self.snapMargin
+        } else if distRight < Self.snapThreshold {
+            f.origin.x = v.maxX - f.width - Self.snapMargin
+        }
 
-        window.setFrame(f, display: true, animate: true)
+        window.setFrame(f, display: true, animate: animated)
         UserDefaults.standard.set(NSStringFromRect(f), forKey: "ballFrame")
+        return f
     }
 
-    /// 按当前设置贴边（启动时 / 切换左右时调用）
+    /// 把球移到设置里指定的那一侧（设置里点「移回边缘」时用）
     func applyEdge(animated: Bool) {
         guard let window, let screen = window.screen ?? NSScreen.main else { return }
         let v = screen.visibleFrame
-        let margin: CGFloat = 14
         var f = window.frame
         f.origin.x = Settings.shared.ballEdge == "left"
-            ? v.minX + margin
-            : v.maxX - f.width - margin
-        f.origin.y = min(max(f.origin.y, v.minY + margin), v.maxY - f.height - margin)
+            ? v.minX + Self.snapMargin
+            : v.maxX - f.width - Self.snapMargin
+        f.origin.y = min(max(f.origin.y, v.minY + Self.snapMargin),
+                         v.maxY - f.height - Self.snapMargin)
         window.setFrame(f, display: true, animate: animated)
+        UserDefaults.standard.set(NSStringFromRect(f), forKey: "ballFrame")
+    }
+
+    /// 首次启动（没有存过位置）时放到默认那一侧
+    func placeAtDefaultEdge() {
+        guard let window, let screen = window.screen ?? NSScreen.main else { return }
+        let v = screen.visibleFrame
+        var f = window.frame
+        f.origin.x = Settings.shared.ballEdge == "left"
+            ? v.minX + Self.snapMargin
+            : v.maxX - f.width - Self.snapMargin
+        if f.origin.y < v.minY || f.origin.y > v.maxY - f.height {
+            f.origin.y = v.midY - f.height / 2
+        }
+        window.setFrame(f, display: false)
         UserDefaults.standard.set(NSStringFromRect(f), forKey: "ballFrame")
     }
 }

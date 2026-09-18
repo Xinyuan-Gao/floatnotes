@@ -1,6 +1,10 @@
 import SwiftUI
 import AppKit
 
+extension Notification.Name {
+    static let floatNotesResetBall = Notification.Name("floatNotesResetBall")
+}
+
 /// 设置项的 SwiftUI 模型：读写都落到 Settings（UserDefaults）
 final class SettingsModel: ObservableObject {
     @Published var coverMenuBar: Bool        { didSet { Settings.shared.coverMenuBar = coverMenuBar } }
@@ -65,6 +69,12 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .disabled(!model.showFloatingBall)
+                Button("把悬浮球移回边缘") {
+                    NotificationCenter.default.post(name: .floatNotesResetBall, object: nil)
+                }
+                .disabled(!model.showFloatingBall)
+                Text("悬浮球可以拖到屏幕任意位置，靠近左右边缘时会自动吸附。")
+                    .font(.caption).foregroundStyle(.secondary)
             } header: {
                 Label("启动按钮", systemImage: "circle.circle")
             }

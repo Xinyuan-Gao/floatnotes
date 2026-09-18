@@ -63,6 +63,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.applyActivationPolicy()
         }
 
+        NotificationCenter.default.addObserver(
+            forName: .floatNotesResetBall, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.resetBallPosition()
+        }
+
         startWatchingNotes()
 
         Self.log("""
@@ -248,6 +254,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ball.target = self
         menu.addItem(ball)
 
+        let resetBall = NSMenuItem(
+            title: "把悬浮球移回边缘", action: #selector(resetBallPosition), keyEquivalent: "")
+        resetBall.target = self
+        menu.addItem(resetBall)
+
         let dock = NSMenuItem(
             title: Settings.shared.showInDock ? "✓ 在程序坞中显示图标" : "在程序坞中显示图标",
             action: #selector(toggleDockIcon), keyEquivalent: "")
@@ -334,19 +345,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func setupFloatingBall() {
         let panel = FloatingBallPanel(origin: NSPoint(x: 0, y: 0))
-        let view = FloatingBallView(frame: NSRect(origin: .zero, size: NSSize(width: 52, height: 52)))
+        let view = FloatingBallView(frame: NSRect(
+            origin: .zero,
+            size: NSSize(width: FloatingBallPanel.ballSize, height: FloatingBallPanel.ballSize)))
         view.onClick = { [weak self] in self?.showLauncherMenu(anchor: view) }
         view.onDoubleClick = { [weak self] in self?.newNote() }
         panel.contentView = view
         ballPanel = panel
         ballView = view
 
-        // 恢复上次位置，再按设置贴边
+        // 恢复上次停的位置；只有从来没放过才用默认那一侧。
+        // 注意不能在这里调 applyEdge —— 那会把用户自己摆好的位置又拽回边缘。
         if let saved = UserDefaults.standard.string(forKey: "ballFrame") {
             let r = NSRectFromString(saved)
-            if r.width > 10 { panel.setFrame(r, display: false) }
+            if r.width > 10, r.height > 10 {
+                panel.setFrame(r, display: false)
+                view.finishDrag(animated: false)   // 夹回屏幕内（换过显示器也不怕）
+            } else {
+                view.placeAtDefaultEdge()
+            }
+        } else {
+            view.placeAtDefaultEdge()
         }
-        applyBallSettings()
+        lastBallEdge = Settings.shared.ballEdge
+
+        if Settings.shared.showFloatingBall {
+            panel.orderFrontRegardless()
+        }
     }
 
     /// 响应「在程序坞中显示图标」开关
@@ -377,14 +402,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        let wasHidden = !panel.isVisible
         panel.orderFrontRegardless()
 
-        // 只在「从隐藏恢复」或「贴边位置改了」的时候才重新吸附，
-        // 否则改个字体 / 透明度都会把球弹一下，很吵。
+        // 只在「贴边位置」这个设置真的被改了的时候才重新吸附。
+        // 启动时 lastBallEdge 已经初始化过，所以不会覆盖恢复出来的位置。
         let edge = Settings.shared.ballEdge
-        if wasHidden || lastBallEdge != edge {
-            ballView?.applyEdge(animated: !wasHidden && lastBallEdge != nil)
+        if lastBallEdge != edge {
+            ballView?.applyEdge(animated: lastBallEdge != nil)
             lastBallEdge = edge
         }
     }
@@ -448,6 +472,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleAll() { NoteWindowManager.shared.toggleAll() }
     @objc private func collapseAll() { NoteWindowManager.shared.collapseAll() }
+
+    @objc private func resetBallPosition() {
+        ballView?.applyEdge(animated: true)
+        Self.log("[ball] 已移回\(Settings.shared.ballEdge == "left" ? "左" : "右")边缘")
+    }
 
     /// ⌥⌘B：隐藏 / 显示悬浮球
     @objc private func toggleFloatingBall() {
@@ -900,6 +929,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func runSelfTest() {
         Self.log("[selftest] 开始")
+        backupSettings()
         baselineMB = Perf.residentMemoryMB()
         Self.log(String(format: "[selftest] 基线内存 %.1f MB", baselineMB))
 
@@ -914,8 +944,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.stage2()
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            self?.finish(ok: false, reason: "编辑器 30 秒内未就绪")
+        // 这是整个自检的总超时，不是单个阶段。阶段越来越多，留足时间。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in
+            self?.finish(ok: false, reason: "自检总时长超过 90 秒")
         }
     }
 
@@ -950,15 +981,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Self.log("[selftest] DOM 探针结果: \(result ?? "nil")")
             self.domProbe = result as? String
 
-            // S3 探针：点击笔记前后的系统前台 App
+            // S3 探针：点笔记窗口后，本 App 不该被激活。
+            // 判据只看「是不是我们自己」——比较前后两个 App 名会很脆：
+            // 用户随手切个窗口就误报，那不叫回归。
             if let p = NoteWindowManager.shared.panel(for: Self.selftestID) {
                 let before = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+                let me = NSRunningApplication.current.localizedName ?? "?"
+                // App 刚启动时自己就可能是前台（尤其 regular 策略），
+                // 那不是「被这次点击抢走的」。所以只判「有没有从别人变成我们」。
+                let wasAlreadyMine = (before == me)
                 p.orderFrontRegardless()
                 p.makeKey()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     let after = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-                    Self.log("[selftest] S3 焦点: 前=\(before) 后=\(after) → "
-                           + (before == after ? "未打断 ✅" : "被打断 ⚠️"))
+                    let stole = (after == me) && !wasAlreadyMine
+                    let note = wasAlreadyMine ? "（起始时本 App 已是前台，本次判定不适用）"
+                                              : (stole ? "本 App 被激活 ⚠️" : "未打断 ✅")
+                    Self.log("[selftest] S3 焦点: 前=\(before) 后=\(after) 本App=\(me) → \(note)")
+                    if stole {
+                        self.problems.append("点击笔记窗口把本 App 变成了前台，会打断阅读")
+                    }
                 }
             }
 
@@ -1234,6 +1276,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: M3 检查
 
+    /// 自检会临时改设置，必须在**所有退出路径**上还原，
+    /// 包括超时和失败——不然用户会发现自己的偏好被悄悄改掉了。
+    private var settingsBackup: [String: Any] = [:]
+    private var ballFrameBackup: String?
+
+    private func backupSettings() {
+        settingsBackup = [
+            "showFloatingBall": Settings.shared.showFloatingBall,
+            "coverMenuBar": Settings.shared.coverMenuBar,
+            "noteFontFamily": Settings.shared.noteFontFamily,
+            "noteFontSize": Settings.shared.noteFontSize,
+        ]
+        ballFrameBackup = UserDefaults.standard.string(forKey: "ballFrame")
+    }
+
+    private func restoreSettings() {
+        if let v = settingsBackup["showFloatingBall"] as? Bool { Settings.shared.showFloatingBall = v }
+        if let v = settingsBackup["coverMenuBar"] as? Bool { Settings.shared.coverMenuBar = v }
+        if let v = settingsBackup["noteFontFamily"] as? String { Settings.shared.noteFontFamily = v }
+        if let v = settingsBackup["noteFontSize"] as? Double { Settings.shared.noteFontSize = v }
+        if let f = ballFrameBackup {
+            UserDefaults.standard.set(f, forKey: "ballFrame")
+        }
+        if let f = ballFrameBackup {
+            let r = NSRectFromString(f)
+            if r.width > 10 { ballPanel?.setFrame(r, display: false) }
+        }
+    }
+
     private var originalFontFamily: String?
     private var originalFontSize: Double?
     private var dailyEntryBaseline = 0
@@ -1352,14 +1423,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func stage13e() {
         guard !finished else { return }
         let before = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+        let me = NSRunningApplication.current.localizedName ?? "?"
+        let wasAlreadyMine = (before == me)
         CaptureToast.shared.show("自检提示")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             let showing = CaptureToast.shared.isShowing
             let after = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-            Self.log("[selftest] 提示面板可见 = \(showing)，前台 App \(before) → \(after)")
+            let stole = (after == me) && !wasAlreadyMine
+            Self.log("[selftest] 提示面板可见 = \(showing)，前台 \(before) → \(after)（本App=\(me)）")
             if !showing { self.problems.append("捕获提示面板未显示") }
-            if before != after { self.problems.append("提示面板抢走了前台 App（\(before) → \(after)）") }
+            if stole { self.problems.append("提示面板把本 App 激活了，会打断阅读") }
             CaptureToast.shared.hide()
             self.cleanupM3()
             self.stage14()
@@ -1492,8 +1566,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 // 还原初始值
                 Settings.shared.showFloatingBall = original
-                self.finish(ok: self.problems.isEmpty,
-                            reason: self.problems.joined(separator: "; "))
+                self.stage16()
             }
         }
     }
@@ -1505,9 +1578,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return !needed.allSatisfy { key in titles.contains { $0.contains(key) } }
     }
 
+    // MARK: 悬浮球拖动检查
+
+    /// 造一个合成鼠标事件。视图内部用的是注入的 mouseLocationProvider，
+    /// 所以事件自带的坐标不影响结果，只为触发 mouseDown/Dragged/Up 这三个回调。
+    private func syntheticMouse(_ type: NSEvent.EventType, clickCount: Int = 1) -> NSEvent? {
+        NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [],
+                           timestamp: ProcessInfo.processInfo.systemUptime,
+                           windowNumber: 0, context: nil,
+                           eventNumber: 0, clickCount: clickCount, pressure: 1)
+    }
+
+    private func stage16() {
+        guard !finished else { return }
+        Self.log("[selftest] 阶段16 · 悬浮球拖动")
+        guard let view = ballView, let panel = ballPanel, let screen = NSScreen.main else {
+            problems.append("拿不到悬浮球"); finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+
+        let originalFrame = panel.frame
+        let v = screen.visibleFrame
+        let size = FloatingBallPanel.ballSize
+
+        // A. 两个「拖背景移动」开关都必须关掉，否则会和手写拖动打架
+        Self.log("[selftest] 拖背景移动: panel=\(panel.isMovableByWindowBackground) view=\(view.mouseDownCanMoveWindow)")
+        if panel.isMovableByWindowBackground {
+            problems.append("面板仍开着 isMovableByWindowBackground，会和手写拖动冲突")
+        }
+        if view.mouseDownCanMoveWindow {
+            problems.append("视图仍允许拖背景移动，会和手写拖动冲突")
+        }
+
+        // B. 自由拖动：放到屏幕正中，模拟拖 (+80, +60)
+        panel.setFrame(NSRect(x: v.midX - size / 2, y: v.midY - size / 2,
+                              width: size, height: size), display: false)
+        let before = panel.frame.origin
+
+        var fake = NSPoint(x: 1000, y: 1000)
+        view.mouseLocationProvider = { fake }
+        view.mouseDown(with: syntheticMouse(.leftMouseDown) ?? NSEvent())
+        fake = NSPoint(x: 1080, y: 1060)
+        view.mouseDragged(with: syntheticMouse(.leftMouseDragged) ?? NSEvent())
+
+        let after = panel.frame.origin
+        let dx = after.x - before.x, dy = after.y - before.y
+        Self.log(String(format: "[selftest] 拖动位移 = (%.0f, %.0f)，期望 (80, 60)", dx, dy))
+        if abs(dx - 80) > 2 || abs(dy - 60) > 2 {
+            problems.append(String(format: "拖动位移不对（%.0f, %.0f）", dx, dy))
+        }
+
+        // C. 在屏幕中间松手 → 不该被拽回边缘
+        view.mouseUp(with: syntheticMouse(.leftMouseUp) ?? NSEvent())
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self else { return }
+            let dropped = panel.frame.origin
+            let distToRight = v.maxX - panel.frame.maxX
+            let distToLeft = panel.frame.minX - v.minX
+            Self.log(String(format: "[selftest] 中间松手后位置 x=%.0f（距左 %.0f / 距右 %.0f）",
+                            dropped.x, distToLeft, distToRight))
+            if distToRight < FloatingBallView.snapThreshold || distToLeft < FloatingBallView.snapThreshold {
+                self.problems.append("在屏幕中间松手却被吸附到了边缘")
+            }
+
+            // D. 靠近右边缘 → 应该磁吸（用同步的 finishDrag，避免动画影响读数）
+            panel.setFrame(NSRect(x: v.maxX - size - 20, y: v.midY,
+                                  width: size, height: size), display: false)
+            view.finishDrag(animated: false)
+            let gapRight = v.maxX - panel.frame.maxX
+            Self.log(String(format: "[selftest] 靠近右边缘时距右 %.0f（阈值 %.0f，吸附后应 ≈ %.0f）",
+                            gapRight, FloatingBallView.snapThreshold, FloatingBallView.snapMargin))
+            if abs(gapRight - FloatingBallView.snapMargin) > 3 {
+                self.problems.append(String(format: "靠近右边缘没有磁吸（距右 %.0f）", gapRight))
+            }
+
+            // E. 靠近左边缘 → 也应该磁吸
+            panel.setFrame(NSRect(x: v.minX + 20, y: v.midY,
+                                  width: size, height: size), display: false)
+            view.finishDrag(animated: false)
+            let gapLeft = panel.frame.minX - v.minX
+            Self.log(String(format: "[selftest] 靠近左边缘时距左 %.0f（应 ≈ %.0f）",
+                            gapLeft, FloatingBallView.snapMargin))
+            if abs(gapLeft - FloatingBallView.snapMargin) > 3 {
+                self.problems.append(String(format: "靠近左边缘没有磁吸（距左 %.0f）", gapLeft))
+            }
+
+            // F. 跑到屏幕外 → 应该被夹回来
+            panel.setFrame(NSRect(x: v.maxX + 500, y: v.minY - 500,
+                                  width: size, height: size), display: false)
+            view.finishDrag(animated: false)
+            let inside = v.contains(panel.frame)
+            Self.log("[selftest] 拖出屏幕后被夹回可见区域 = \(inside)")
+            if !inside { self.problems.append("拖出屏幕后没有被夹回") }
+
+            // 还原位置
+            panel.setFrame(originalFrame, display: false)
+            UserDefaults.standard.set(NSStringFromRect(originalFrame), forKey: "ballFrame")
+            self.finish(ok: self.problems.isEmpty,
+                        reason: self.problems.joined(separator: "; "))
+        }
+    }
+
     private func finish(ok: Bool, reason: String) {
         guard !finished else { return }
         finished = true
+
+        // 无论走哪条路（成功 / 断言失败 / 超时）都要把用户设置还原
+        restoreSettings()
 
         Self.log("[selftest] 窗口诊断:\n\(NoteWindowManager.shared.diagnostics())")
         Self.log("[selftest] \(Perf.report(windows: NoteWindowManager.shared.openCount))")
