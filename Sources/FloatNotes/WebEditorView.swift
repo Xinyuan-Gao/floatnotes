@@ -48,9 +48,13 @@ final class WebEditorView: NSView {
         // ★ 自定义 scheme 必须在创建 WKWebView 之前注册
         if let dir = Self.locateEditorDir() {
             editorDir = dir
+            // 背景图放在 bundle 的 Resources 下
+            let res = Bundle.main.resourceURL
             let handler = EditorSchemeHandler(
                 editorDir: dir,
-                attachmentsDir: NoteStore.shared.attachmentsDir
+                attachmentsDir: NoteStore.shared.attachmentsDir,
+                backgroundsDir: res?.appendingPathComponent("backgrounds"),
+                thumbsDir: res?.appendingPathComponent("background-thumbs")
             )
             cfg.setURLSchemeHandler(handler, forURLScheme: EditorSchemeHandler.scheme)
             schemeHandler = handler
@@ -139,6 +143,18 @@ final class WebEditorView: NSView {
             }
             completion(o["ok"] as? Bool ?? false)
         }
+    }
+
+    /// 已应用的背景。applySettings() 在任何设置变动时都会对每个窗口调一遍，
+    /// 不缓存的话背景会被反复重设、日志刷屏（真发生过）。
+    private var appliedBackground: String?
+
+    /// 背景图。传 "none" 表示不要背景。
+    func setBackground(_ key: String, isDark: Bool) {
+        guard appliedBackground != key else { return }
+        appliedBackground = key
+        evaluate("void (window.FloatNotes && window.FloatNotes.setBackground("
+               + "\(Self.jsString(key)), \(isDark)));")
     }
 
     /// 正文字体（CSS font-family）

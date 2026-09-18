@@ -920,6 +920,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         themeItem.submenu = themeMenu
         sub.addItem(themeItem)
 
+        // 背景（单篇覆盖）
+        let bgItem = NSMenuItem(title: "背景", action: nil, keyEquivalent: "")
+        let bgMenu = NSMenu()
+        let curBG = Settings.shared.background(for: id)
+        let followsGlobal = !Settings.shared.hasOwnBackground(id)
+
+        let follow = NSMenuItem(
+            title: (followsGlobal ? "✓ " : "") + "跟随全局（\(BackgroundCatalog.label(for: Settings.shared.noteBackground))）",
+            action: #selector(setBackgroundAction(_:)), keyEquivalent: "")
+        follow.target = self
+        follow.representedObject = ["id": id, "value": NSNull()]
+        bgMenu.addItem(follow)
+        bgMenu.addItem(.separator())
+
+        for opt in BackgroundCatalog.all {
+            let mi = NSMenuItem(title: (!followsGlobal && curBG == opt.key ? "✓ " : "") + opt.label,
+                                action: #selector(setBackgroundAction(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = ["id": id, "value": opt.key]
+            bgMenu.addItem(mi)
+        }
+        bgItem.submenu = bgMenu
+        sub.addItem(bgItem)
+
         // 置顶开关
         let pinned = NoteWindowManager.shared.panel(for: id)?.isPinnedOnTop ?? true
         let pin = NSMenuItem(title: pinned ? "✓ 保持置顶" : "保持置顶",
@@ -953,6 +977,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let id = info["id"] as? String, let v = info["value"] as? Double else { return }
         Settings.shared.setOpacity(v, for: id)
         Self.log("[appearance] \(id) 透明度 → \(Int(v * 100))%")
+    }
+
+    @objc private func setBackgroundAction(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: Any],
+              let id = info["id"] as? String else { return }
+        if info["value"] is NSNull {
+            Settings.shared.setBackground(nil, for: id)       // 跟随全局
+            Self.log("[bg] \(id) 背景 → 跟随全局")
+        } else if let key = info["value"] as? String {
+            Settings.shared.setBackground(key, for: id)
+            Self.log("[bg] \(id) 背景 → \(BackgroundCatalog.label(for: key))")
+        }
     }
 
     @objc private func setThemeAction(_ sender: NSMenuItem) {
@@ -1216,6 +1252,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         editor.setFontFamily(FontCatalog.css(for: "pingfang"))
         editor.setTheme("light")
         editor.onReady = {
+            // ★ 必须在 onReady 之后调 —— 编辑器就绪前 window.FloatNotes 还不存在，
+            //   提前调用会静默失效（踩过）
+            let bgKey = Settings.shared.noteBackground
+            editor.setBackground(bgKey, isDark: BackgroundCatalog.isDark(bgKey))
             editor.load(markdown: Self.screenshotMarkdown)
         }
         panel.contentView = editor
@@ -1812,6 +1852,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "coverMenuBar": Settings.shared.coverMenuBar,
             "noteFontFamily": Settings.shared.noteFontFamily,
             "noteFontSize": Settings.shared.noteFontSize,
+            "noteBackground": Settings.shared.noteBackground,
         ]
         ballFrameBackup = UserDefaults.standard.string(forKey: "ballFrame")
     }
@@ -1821,6 +1862,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let v = settingsBackup["coverMenuBar"] as? Bool { Settings.shared.coverMenuBar = v }
         if let v = settingsBackup["noteFontFamily"] as? String { Settings.shared.noteFontFamily = v }
         if let v = settingsBackup["noteFontSize"] as? Double { Settings.shared.noteFontSize = v }
+        if let v = settingsBackup["noteBackground"] as? String { Settings.shared.noteBackground = v }
         if let f = ballFrameBackup {
             UserDefaults.standard.set(f, forKey: "ballFrame")
         }
@@ -2673,9 +2715,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         NoteStore.shared.deleteAttachment(name)
                     }
                     PasteboardSnapshot.restore(savedClipboard)
+                    self.stage20()
+                }
+            }
+        }
+    }
 
-                    self.finish(ok: self.problems.isEmpty,
-                                reason: self.problems.joined(separator: "; "))
+    // MARK: 笔记背景检查
+
+    private func stage20() {
+        guard !finished else { return }
+        Self.log("[selftest] 阶段20 · 笔记背景")
+
+        // A. 清单与缩略图
+        let opts = BackgroundCatalog.all
+        let pics = opts.filter { $0.key != "none" }
+        let missing = pics.filter { BackgroundCatalog.thumbnail(for: $0.key) == nil }
+        Self.log("[selftest] 背景选项 \(opts.count) 个（\(pics.count) 张图 + 无背景）；"
+               + "缺缩略图 \(missing.count) 个")
+        if pics.count < 18 { problems.append("背景图数量不足（\(pics.count)）") }
+        if !missing.isEmpty {
+            problems.append("缩略图缺失：\(missing.prefix(3).map(\.key).joined(separator: ","))")
+        }
+
+        guard let ed = NoteWindowManager.shared.editor(for: Self.selftestID) else {
+            problems.append("拿不到编辑器，无法验证背景链路")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+
+        // B. 背景图能不能经 floatnotes://bg/ 取到
+        let probeKey = pics.first?.key ?? "01-grid-apple"
+        ed.evaluate("window.FloatNotes._startBgProbe('\(probeKey)');") { [weak self] _ in
+            self?.pollBackground(ed: ed, key: probeKey, attempt: 0)
+        }
+    }
+
+    private func pollBackground(ed: WebEditorView, key: String, attempt: Int) {
+        guard !finished else { return }
+        if attempt > 25 {
+            problems.append("背景图加载超时")
+            stage20c(ed: ed); return
+        }
+        ed.evaluate("window.__fnBg ? JSON.stringify(window.__fnBg) : 'null'") { [weak self] raw in
+            guard let self else { return }
+            guard let s = raw as? String, s != "null",
+                  let d = s.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  (o["done"] as? Bool) == true else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    self.pollBackground(ed: ed, key: key, attempt: attempt + 1)
+                }
+                return
+            }
+            let ok = o["ok"] as? Bool ?? false
+            let w = (o["w"] as? NSNumber)?.intValue ?? 0
+            let h = (o["h"] as? NSNumber)?.intValue ?? 0
+            Self.log("[selftest] 背景图经 scheme 取回：\(ok) \(w)×\(h)（\(key)）")
+            if !ok || w == 0 { self.problems.append("背景图没能经 floatnotes://bg/ 取到") }
+            self.stage20c(ed: ed)
+        }
+    }
+
+    /// C. 应用背景后 CSS 与主题是否跟着变
+    private func stage20c(ed: WebEditorView) {
+        // 浅色背景
+        ed.setBackground("09-blossom-grid", isDark: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            ed.evaluate("window.FloatNotes._bgState()") { raw in
+                let lightState = (raw as? String) ?? "null"
+                Self.log("[selftest] 浅色背景状态: \(lightState)")
+
+                // 深色背景
+                ed.setBackground("12-night-stars", isDark: true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    ed.evaluate("window.FloatNotes._bgState()") { raw2 in
+                        let darkState = (raw2 as? String) ?? "null"
+                        Self.log("[selftest] 深色背景状态: \(darkState)")
+
+                        func parse(_ s: String) -> [String: Any] {
+                            guard let d = s.data(using: .utf8),
+                                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
+                            else { return [:] }
+                            return o
+                        }
+                        let light = parse(lightState), dark = parse(darkState)
+                        if (light["hasClass"] as? Bool) != true {
+                            self.problems.append("浅色背景没有生效（class 没加上）")
+                        }
+                        if !((light["bg"] as? String) ?? "").contains("floatnotes://bg/") {
+                            self.problems.append("浅色背景的 background-image 没设上")
+                        }
+                        if (dark["isDark"] as? Bool) != true {
+                            self.problems.append("深色背景没标记为 dark")
+                        }
+
+                        // 恢复成用户原本的设置
+                        let original = Settings.shared.noteBackground
+                        ed.setBackground(original, isDark: BackgroundCatalog.isDark(original))
+                        self.finish(ok: self.problems.isEmpty,
+                                    reason: self.problems.joined(separator: "; "))
+                    }
                 }
             }
         }

@@ -4,6 +4,8 @@ import WebKit
 ///
 ///   floatnotes://editor/index.html    → App 内置的编辑器页面
 ///   floatnotes://media/<文件名>        → 笔记附件目录里的图片
+///   floatnotes://bg/<文件名>           → 内置背景图
+///   floatnotes://bgthumb/<文件名>      → 背景缩略图（设置面板用）
 ///
 /// 为什么需要它：粘贴图片后编辑器要把图片显示出来，而图片存在
 /// `~/Documents/悬浮笔记/attachments/`，在 `file://` 页面里既跨了目录
@@ -15,10 +17,15 @@ final class EditorSchemeHandler: NSObject, WKURLSchemeHandler {
 
     private let editorDir: URL
     private let attachmentsDir: URL
+    private let backgroundsDir: URL?
+    private let thumbsDir: URL?
 
-    init(editorDir: URL, attachmentsDir: URL) {
+    init(editorDir: URL, attachmentsDir: URL,
+         backgroundsDir: URL? = nil, thumbsDir: URL? = nil) {
         self.editorDir = editorDir
         self.attachmentsDir = attachmentsDir
+        self.backgroundsDir = backgroundsDir
+        self.thumbsDir = thumbsDir
     }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
@@ -29,8 +36,16 @@ final class EditorSchemeHandler: NSObject, WKURLSchemeHandler {
 
         let root: URL
         switch url.host {
-        case "editor": root = editorDir
-        case "media":  root = attachmentsDir
+        case "editor":  root = editorDir
+        case "media":   root = attachmentsDir
+        case "bg":      guard let d = backgroundsDir else {
+                            task.didFailWithError(fail("没有配置背景目录")); return
+                        }
+                        root = d
+        case "bgthumb": guard let d = thumbsDir else {
+                            task.didFailWithError(fail("没有配置缩略图目录")); return
+                        }
+                        root = d
         default:
             task.didFailWithError(fail("未知 host: \(url.host ?? "nil")"))
             return

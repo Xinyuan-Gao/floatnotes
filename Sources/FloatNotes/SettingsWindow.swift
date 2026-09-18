@@ -16,6 +16,7 @@ final class SettingsModel: ObservableObject {
     @Published var noteFontFamily: String    { didSet { Settings.shared.noteFontFamily = noteFontFamily } }
     @Published var captureMode: String       { didSet { Settings.shared.captureMode = captureMode } }
     @Published var showInDock: Bool          { didSet { Settings.shared.showInDock = showInDock } }
+    @Published var noteBackground: String    { didSet { Settings.shared.noteBackground = noteBackground } }
 
     @Published var launchAtLoginNote: String = LaunchAtLogin.statusDescription
 
@@ -30,6 +31,7 @@ final class SettingsModel: ObservableObject {
         noteFontFamily = s.noteFontFamily
         captureMode = s.captureMode
         showInDock = s.showInDock
+        noteBackground = s.noteBackground
     }
 
     func refreshLoginStatus() {
@@ -127,6 +129,23 @@ struct SettingsView: View {
             }
 
             Section {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 68), spacing: 8)], spacing: 10) {
+                    ForEach(BackgroundCatalog.all, id: \.key) { opt in
+                        backgroundCell(opt, selected: model.noteBackground == opt.key) {
+                            model.noteBackground = opt.key
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+                Text("所有笔记的默认背景。想给某一篇单独设，用菜单栏里的「当前笔记 › 背景」。")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("选了背景之后主题会跟着背景走（浅底配深字、深底配浅字），否则会看不清。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: {
+                Label("笔记背景", systemImage: "photo.on.rectangle.angled")
+            }
+
+            Section {
                 Picker("划词后", selection: $model.captureMode) {
                     Text("静默存入今日笔记").tag("daily")
                     Text("弹出新窗口").tag("window")
@@ -170,8 +189,39 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 760)
+        .frame(width: 520, height: 860)
         .onAppear { model.refreshLoginStatus() }
+    }
+
+    @ViewBuilder
+    private func backgroundCell(_ opt: BackgroundOption, selected: Bool,
+                                action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.10))
+                    if let img = BackgroundCatalog.thumbnail(for: opt.key) {
+                        Image(nsImage: img).resizable().scaledToFill()
+                    } else {
+                        Image(systemName: "nosign").font(.system(size: 18))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .frame(width: 62, height: 82)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(selected ? Color.accentColor : Color.secondary.opacity(0.22),
+                                lineWidth: selected ? 2.5 : 1)
+                )
+                Text(opt.label)
+                    .font(.system(size: 9))
+                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                    .lineLimit(1).frame(width: 66)
+            }
+        }
+        .buttonStyle(.plain)
+        .help(opt.label)
     }
 
     private func shortcutRow(_ key: String, _ desc: String) -> some View {

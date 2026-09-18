@@ -13,6 +13,36 @@
       html, body, #root { height: 100%; margin: 0; padding: 0; }
       body { background: transparent; overflow: hidden; }
 
+      /* ── 笔记背景 ────────────────────────────────────────
+         图片铺满窗口，上面压一层很淡的护罩保证正文对比度。
+         护罩不能太重，否则背景就看不出花样了。 */
+      body.fn-has-bg {
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+        background-attachment: fixed;
+      }
+      body.fn-has-bg::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background: rgba(255, 255, 255, 0.25);
+        pointer-events: none;
+        z-index: 0;
+      }
+      /* 深色底用深护罩，否则黑字压深蓝完全看不清 */
+      body.fn-has-bg.fn-bg-dark::before {
+        background: rgba(0, 0, 0, 0.30);
+      }
+      body.fn-has-bg #root { position: relative; z-index: 1; }
+
+      /* 编辑器自己的底色要透掉，不然背景被盖住 */
+      body.fn-has-bg .bn-container,
+      body.fn-has-bg .bn-editor,
+      body.fn-has-bg .bn-block-outer {
+        background-color: transparent !important;
+      }
+
       /* 收紧内边距，更适合小窗 */
       .bn-container { height: 100%; }
 

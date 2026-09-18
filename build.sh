@@ -28,6 +28,11 @@ cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/editor-src/dist/index.html" "$APP/Contents/Resources/editor/index.html"
 
+# 笔记背景图 + 设置面板用的缩略图
+mkdir -p "$APP/Contents/Resources/backgrounds" "$APP/Contents/Resources/background-thumbs"
+cp "$ROOT/Resources/backgrounds/"*.jpg "$APP/Contents/Resources/backgrounds/" 2>/dev/null || true
+cp "$ROOT/Resources/background-thumbs/"*.jpg "$APP/Contents/Resources/background-thumbs/" 2>/dev/null || true
+
 # 写进构建时间戳。之前被「到底开的是哪一版」坑过一次 ——
 # 磁盘上留着旧副本，光看外观分不出新旧。现在菜单栏「关于」里就能看到。
 STAMP="$(date +%Y%m%d.%H%M)"

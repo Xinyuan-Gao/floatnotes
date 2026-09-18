@@ -124,6 +124,34 @@ final class Settings {
         notify()
     }
 
+    // MARK: - 笔记背景
+
+    /// 全局默认背景（BackgroundCatalog 的 key）
+    var noteBackground: String {
+        get { d.string(forKey: "noteBackground") ?? "none" }
+        set { d.set(newValue, forKey: "noteBackground"); notify() }
+    }
+
+    /// 某篇笔记实际用的背景：它自己有覆盖就用它自己的，否则跟随全局
+    func background(for id: String) -> String {
+        d.string(forKey: "bg.\(id)") ?? noteBackground
+    }
+
+    /// 这篇笔记是不是单独设过背景
+    func hasOwnBackground(_ id: String) -> Bool {
+        d.object(forKey: "bg.\(id)") != nil
+    }
+
+    /// 给单篇设背景；传 nil 表示「跟随全局」
+    func setBackground(_ key: String?, for id: String) {
+        if let key {
+            d.set(key, forKey: "bg.\(id)")
+        } else {
+            d.removeObject(forKey: "bg.\(id)")
+        }
+        notify()
+    }
+
     // MARK: - 首次启动
 
     var hasOnboarded: Bool {

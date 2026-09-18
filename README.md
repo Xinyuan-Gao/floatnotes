@@ -53,6 +53,7 @@
 - 标准剪贴板快捷键：⌘X / ⌘C / ⌘V / ⌘A / ⌘Z / ⇧⌘Z
 - 粘贴图片自动落盘到附件目录
 - 8 种正文字体（苹方 / 宋体 / 楷体 / 圆体 / 等宽…）+ 12–26pt 字号
+- **18 种便签纸背景**，10 个色系（米白 / 鼠尾草绿 / 藕粉 / 雾霾蓝 / 深蓝夜空 / 奶油黄 / 薰衣草紫 / 牛皮纸 / 莫兰迪灰…）
 - 每篇笔记独立的透明度、主题、置顶开关
 
 **其他**
@@ -111,6 +112,8 @@ panel.isFloatingPanel = true
 **点击笔记不抢焦点**靠的是面板的 `.nonactivatingPanel` 样式。这一点和 App 的激活策略互相独立，所以有 Dock 图标 / 纯菜单栏两种形态都不影响它。
 
 **粘贴的图片**通过自定义 URL scheme `floatnotes://` 提供，绕开了 `file://` 下的跨目录读取限制，也不用起本地 HTTP 服务。
+
+**笔记背景**是 18 张生成好的便签纸图，压缩版共 2.5 MB 打进 bundle，经 `floatnotes://bg/` 提供给编辑器。背景会**反过来决定主题**——浅底配深字、深底配浅字。不这么做就会出现「深字压深底」这种完全看不清的组合（第一版就是这么翻车的）。
 
 **截图**走 ScreenCaptureKit。老的 `CGWindowListCreateImage` 在新 SDK 里已经标为 unavailable，所以用的是 `SCContentFilter` + `SCStreamConfiguration`（macOS 14.0 起可用），而不是只支持 15.2+ 的 `captureImage(in:)`。
 
@@ -198,7 +201,7 @@ identifier "com.xy.floatnotes" and certificate root = H"<证书哈希>"
 | 可执行文件 | 1.1 MB |
 | 基线内存 | 61 MB |
 | 每个笔记窗口增量 | 约 5.2 MB |
-| 自检覆盖 | 19 个阶段（含截图链路与剪贴板回环） |
+| 自检覆盖 | 20 个阶段（含截图链路、剪贴板回环、背景链路） |
 
 ## 文档
 

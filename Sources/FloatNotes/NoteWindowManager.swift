@@ -77,6 +77,8 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
             editor?.setFontSize(Settings.shared.noteFontSize)
             editor?.setFontFamily(FontCatalog.css(for: Settings.shared.noteFontFamily))
             editor?.setTheme(Settings.shared.theme(for: id))
+            let bg = Settings.shared.background(for: id)
+            editor?.setBackground(bg, isDark: BackgroundCatalog.isDark(bg))
             panel?.applyAppearance(opacity: Settings.shared.opacity(for: id))
             NotificationCenter.default.post(name: .floatNotesEditorReady, object: nil)
         }
@@ -198,6 +200,9 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
             (p.contentView as? WebEditorView)?.setFontFamily(
                 FontCatalog.css(for: Settings.shared.noteFontFamily))
             (p.contentView as? WebEditorView)?.setTheme(Settings.shared.theme(for: id))
+            let bg = Settings.shared.background(for: id)
+            (p.contentView as? WebEditorView)?.setBackground(
+                bg, isDark: BackgroundCatalog.isDark(bg))
             p.applyAppearance(opacity: Settings.shared.opacity(for: id))
         }
         onLog?("[settings] 已应用：层级=\(lvl.rawValue) 字号=\(Int(fs))pt "

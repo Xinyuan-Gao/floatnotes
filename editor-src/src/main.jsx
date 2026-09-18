@@ -133,6 +133,35 @@ function App() {
           document.documentElement.style.setProperty("--fn-font-size", n + "px");
         }
       },
+      // 笔记背景图。key 是 BackgroundCatalog 里的文件名（不含扩展名），
+      // "none" 表示不要背景。isDark 决定用深护罩还是浅护罩。
+      setBackground(key, isDark) {
+        const body = document.body;
+        if (!key || key === "none") {
+          body.classList.remove("fn-has-bg", "fn-bg-dark");
+          body.style.backgroundImage = "";
+          return;
+        }
+        body.classList.add("fn-has-bg");
+        body.classList.toggle("fn-bg-dark", !!isDark);
+        const url = "floatnotes://bg/" + key + ".jpg";
+        body.style.backgroundImage = 'url("' + url + '")';
+        // 报一下加载结果 —— scheme 没配对的话这里会立刻暴露
+        const probe = new Image();
+        probe.onload = () => log("背景已加载：" + key + " " + probe.naturalWidth + "×" + probe.naturalHeight);
+        probe.onerror = () => log("背景加载失败：" + key + "（" + url + "）");
+        probe.src = url;
+
+        // ★ 背景反过来决定主题。
+        //   浅底必须配浅色主题（深字），深底必须配深色主题（浅字）——
+        //   否则会出现「深字压深底」这种完全看不清的组合。
+        //   所以只要选了背景，就由背景说了算，忽略单独的主题设置。
+        window.dispatchEvent(
+          new CustomEvent("fn-theme", { detail: isDark ? "dark" : "light" })
+        );
+        log("背景主题：跟随背景 → " + (isDark ? "深色" : "浅色"));
+      },
+
       // 正文字体（CSS font-family 字符串）
       setFontFamily(css) {
         if (typeof css === "string" && css.trim()) {
@@ -191,6 +220,26 @@ function App() {
       _uploadResult(id, filename) {
         const fn = pendingUploads.get(id);
         if (fn) fn(filename);
+      },
+      // 自检用：验证背景图能不能经 floatnotes://bg/ 取到
+      _startBgProbe(key) {
+        window.__fnBg = { done: false, ok: false, w: 0, h: 0 };
+        const img = new Image();
+        img.onload = () => {
+          window.__fnBg = { done: true, ok: true, w: img.naturalWidth, h: img.naturalHeight };
+        };
+        img.onerror = () => { window.__fnBg = { done: true, ok: false, w: 0, h: 0 }; };
+        img.src = "floatnotes://bg/" + key + ".jpg";
+        return "started";
+      },
+      // 自检用：当前背景状态
+      _bgState() {
+        const cs = getComputedStyle(document.body);
+        return JSON.stringify({
+          hasClass: document.body.classList.contains("fn-has-bg"),
+          isDark: document.body.classList.contains("fn-bg-dark"),
+          bg: cs.backgroundImage.slice(0, 80),
+        });
       },
       // 自检用：某个坐标点算不算空白
       _testBlankAt(x, y) {
