@@ -97,6 +97,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exit(0)
         }
 
+        // --perm-check <输出文件>：把屏幕录制权限的判定结果写出来并退出。
+        // 用来区分「从终端直接跑（会继承终端的权限身份）」和「正常启动」两种情况。
+        if let i = CommandLine.arguments.firstIndex(of: "--perm-check") {
+            let out = (i + 1 < CommandLine.arguments.count)
+                ? CommandLine.arguments[i + 1] : "/tmp/floatnotes-perm.txt"
+            let trusted = CGPreflightScreenCaptureAccess()
+            var report = """
+            时间: \(Date())
+            bundle: \(Bundle.main.bundlePath)
+            bundleID: \(Bundle.main.bundleIdentifier ?? "?")
+            CGPreflightScreenCaptureAccess: \(trusted)
+            父进程 PID: \(getppid())
+            """
+            // 自己的 cdhash —— TCC 对 ad-hoc 签名就是按它认的
+            if let exe = Bundle.main.executableURL {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+                p.arguments = ["-dvvv", exe.path]
+                let pipe = Pipe()
+                p.standardError = pipe
+                try? p.run()
+                p.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let text = String(data: data, encoding: .utf8) ?? ""
+                for line in text.split(separator: "\n") where line.contains("CDHash=") || line.contains("Signature=") {
+                    report += "\n\(line)"
+                }
+            }
+            try? report.write(to: URL(fileURLWithPath: out), atomically: true, encoding: .utf8)
+            exit(trusted ? 0 : 1)
+        }
+
         // --overlay-probe [秒]：延迟若干秒后拉一次截图遮罩，并报告它在不在当前 Space。
         // 用来排查「在别的桌面全屏时按截图，图跑到另一个桌面」这类问题。
         if let i = CommandLine.arguments.firstIndex(of: "--overlay-probe") {
@@ -147,6 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "dev"
         Self.log("[app] 构建 \(build) · \(Bundle.main.bundlePath)")
+        Self.log("[app] 屏幕录制权限 = \(ScreenCapture.hasPermission)（父进程 PID \(getppid())）")
 
         Self.log("""
         ─────────────────────────────────────────────
@@ -366,6 +399,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         addCurrentNoteMenu(to: menu)
+
+        menu.addItem(.separator())
+
+        let permTitle = ScreenCapture.hasPermission
+            ? "屏幕录制权限：已授权"
+            : "⚠️  屏幕录制权限：未授权（点此处理）"
+        let perm = NSMenuItem(title: permTitle,
+                              action: #selector(showPermissionHelp), keyEquivalent: "")
+        perm.target = self
+        menu.addItem(perm)
+
+        let restart = NSMenuItem(title: "重启悬浮笔记", action: #selector(restartApp), keyEquivalent: "")
+        restart.target = self
+        menu.addItem(restart)
 
         menu.addItem(.separator())
 
@@ -707,21 +754,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func promptScreenRecording() {
         let alert = NSAlert()
-        alert.messageText = "需要「屏幕录制」权限才能截图"
+        alert.messageText = "还差「屏幕录制」权限"
         alert.informativeText = """
-        悬浮笔记要截取屏幕内容，需要这项系统权限。
+        截图需要这项系统权限。
 
-        点「打开系统设置」后，在「隐私与安全性 › 屏幕录制」里勾选「悬浮笔记」。
-        授权后如果还不生效，重启一次 App 即可。
+        如果你觉得「我明明已经开了」，通常是这两个原因：
+
+        ① 授权之后没重启 App。这项权限只对新启动的进程生效。
+
+        ② 系统设置里那条是旧版本的记录。每次重新构建，App 的签名都会变，
+           系统会当成另一个程序 —— 那条记录显示「已开启」，
+           但对现在这份二进制并不生效。
+
+        建议先点「清除旧记录并重新授权」，它会清掉历史记录并重新发起申请。
+        你在系统设置里勾选之后，再点「重启 App」。
         """
+        alert.addButton(withTitle: "清除旧记录并重新授权")
         alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "重启 App")
         alert.addButton(withTitle: "稍后")
         NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            let cleared = ScreenCapture.resetPermission()
+            Self.log("[perm] 清除旧记录 = \(cleared ? "成功" : "失败")")
             ScreenCapture.requestPermission()
             ScreenCapture.openPrivacySettings()
+            Self.log("[perm] 已重新申请；勾选后请点「重启 App」")
+        case .alertSecondButtonReturn:
+            ScreenCapture.requestPermission()
+            ScreenCapture.openPrivacySettings()
+        case .alertThirdButtonReturn:
+            relaunchApp()
+        default:
+            break
         }
     }
+
+    /// 重启自己：开一个新实例，再把当前这个退掉。
+    /// 屏幕录制权限只对新进程生效，所以这是绕不开的一步。
+    private func relaunchApp() {
+        let url = Bundle.main.bundleURL
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, error in
+            DispatchQueue.main.async {
+                if let error {
+                    Self.log("[perm] 重启失败: \(error.localizedDescription)")
+                } else {
+                    Self.log("[perm] 已启动新实例，退出当前这个")
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    @objc private func showPermissionHelp() { promptScreenRecording() }
+
+    @objc private func restartApp() { relaunchApp() }
 
     @objc private func openTriage() {
         TriageWindowController.shared.toggle()

@@ -31,6 +31,37 @@ enum ScreenCapture {
         }
     }
 
+    /// 清掉系统里本 App 的屏幕录制授权记录。
+    ///
+    /// 为什么需要这个：ad-hoc 签名没有稳定身份，TCC 是按 cdhash 认的，
+    /// 而每次重新构建 cdhash 都会变。于是系统设置里会挂着一堆同名条目，
+    /// 显示「已开启」但对当前这份二进制不生效 —— 用户看到的就是
+    /// 「我明明开了，怎么还一直让我去开」。
+    /// 清掉之后重新申请，系统会给出干净的一条。
+    @discardableResult
+    static func resetPermission() -> Bool {
+        guard let id = Bundle.main.bundleIdentifier else { return false }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        p.arguments = ["reset", "ScreenCapture", id]
+        p.standardOutput = Pipe()
+        p.standardError = Pipe()
+        do {
+            try p.run()
+            p.waitUntilExit()
+            NSLog("[ScreenCapture] tccutil reset 退出码=\(p.terminationStatus)")
+            return p.terminationStatus == 0
+        } catch {
+            NSLog("[ScreenCapture] tccutil 执行失败: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// 当前这份二进制有没有权限（不发系统提示）
+    static var statusText: String {
+        hasPermission ? "已授权" : "未授权"
+    }
+
     // MARK: - 截取
 
     /// 截取屏幕上的一个矩形（屏幕点坐标，左上原点）。
