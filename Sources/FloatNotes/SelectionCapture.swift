@@ -45,6 +45,12 @@ enum SelectionCapture {
         let front = NSWorkspace.shared.frontmostApplication
         let appName = front?.localizedName
 
+        // 如果前台就是我们自己，模拟 ⌘C 只会去复制我们自己的内容
+        // （WKWebView 甚至会把整页复制成 web archive），
+        // 既没有意义，还会把用户的剪贴板冲掉。直接不兜底。
+        let isSelf = front?.bundleIdentifier == Bundle.main.bundleIdentifier
+        let mayUseClipboard = allowClipboardFallback && !isSelf
+
         if let (text, element) = axSelectedText(), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let title = element.flatMap { windowTitle(from: $0) }
             let url = element.flatMap { documentURL(from: $0) }
@@ -52,7 +58,7 @@ enum SelectionCapture {
                                      sourceTitle: title, sourceURL: url, method: "AX")
         }
 
-        if allowClipboardFallback, let text = clipboardSelection(),
+        if mayUseClipboard, let text = clipboardSelection(),
            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let window = axFocusedWindow()
             let title = window.flatMap { copyAttr($0, attrTitle) as? String }
@@ -120,15 +126,7 @@ enum SelectionCapture {
     private static func clipboardSelection() -> String? {
         let pb = NSPasteboard.general
         let savedCount = pb.changeCount
-
-        // 备份原有内容（尽量保留富文本）
-        let savedItems = pb.pasteboardItems?.compactMap { item -> [NSPasteboard.PasteboardType: Data] in
-            var dict: [NSPasteboard.PasteboardType: Data] = [:]
-            for type in item.types {
-                if let d = item.data(forType: type) { dict[type] = d }
-            }
-            return dict
-        } ?? []
+        let savedItems = PasteboardSnapshot.capture()
 
         postCommandC()
 
@@ -140,25 +138,38 @@ enum SelectionCapture {
         }
 
         guard pb.changeCount != savedCount else {
-            restore(savedItems)
+            PasteboardSnapshot.restore(savedItems)
             return nil
         }
 
+        // ★ 再等一小会儿再读、再还原。
+        //   ⌘C 的剪贴板写入是「异步」的（WKWebView 要经 web 进程转发），
+        //   changeCount 变了只说明有人开始写，不代表数据已经落定。
+        //   立刻还原的话，会被那个迟到的写入覆盖掉 —— 表现就是剪贴板被清空。
+        usleep(200_000)
+
         let text = pb.string(forType: .string)
-        restore(savedItems)
+        PasteboardSnapshot.restore(savedItems)
+
+        // ⌘C 的落地时间可能比想象中晚得多（WKWebView 要经 web 进程，
+        // 实测能拖到一秒以上）。这里隔一段时间再确认一次，
+        // 被覆盖就再还一次 —— 用户原来的剪贴板不能被我们弄丢。
+        scheduleRestoreCheck(savedItems)
         return text
+
     }
 
-    private static func restore(_ items: [[NSPasteboard.PasteboardType: Data]]) {
-        guard !items.isEmpty else { return }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        let objects = items.map { dict -> NSPasteboardItem in
-            let item = NSPasteboardItem()
-            for (type, data) in dict { item.setData(data, forType: type) }
-            return item
+    /// 延迟复查：迟到的写入盖掉了就再还原一次
+    private static func scheduleRestoreCheck(_ savedItems: PasteboardSnapshot.Items) {
+        guard let want = savedItems.first?[.string].flatMap({ String(data: $0, encoding: .utf8) })
+        else { return }
+        for delay in [0.6, 1.5, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                if NSPasteboard.general.string(forType: .string) != want {
+                    PasteboardSnapshot.restore(savedItems)
+                }
+            }
         }
-        pb.writeObjects(objects)
     }
 
     private static func postCommandC() {

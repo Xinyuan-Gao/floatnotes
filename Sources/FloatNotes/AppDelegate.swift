@@ -10,6 +10,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var isSelfTest = false
 
+    // MARK: - 主菜单
+    //
+    // 纯代码创建的 App 默认没有主菜单。而 macOS 的 ⌘C / ⌘V / ⌘X / ⌘A / ⌘Z
+    // 并不是系统自动处理的 —— 它们靠「编辑」菜单里那些标准 selector
+    // （copy: / paste: …）沿响应链转发。没有这个菜单，剪贴板快捷键
+    // 就完全没有入口，WKWebView 永远收不到 paste:，表现就是「粘不进去」。
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        buildMainMenu()
+    }
+
+    private func buildMainMenu() {
+        func item(_ title: String, _ action: String, _ key: String = "",
+                  _ mods: NSEvent.ModifierFlags = [.command]) -> NSMenuItem {
+            let i = NSMenuItem(title: title, action: Selector(action), keyEquivalent: key)
+            i.keyEquivalentModifierMask = mods
+            return i
+        }
+
+        let main = NSMenu()
+
+        // ── 应用菜单 ──
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appItem.submenu = appMenu
+        appMenu.addItem(item("关于悬浮笔记", "orderFrontStandardAboutPanel:", ""))
+        appMenu.addItem(.separator())
+        appMenu.addItem(item("隐藏悬浮笔记", "hide:", "h"))
+        appMenu.addItem(.separator())
+        appMenu.addItem(item("退出悬浮笔记", "terminate:", "q"))
+        main.addItem(appItem)
+
+        // ── 编辑菜单（关键：剪贴板快捷键的入口）──
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        editItem.submenu = editMenu
+        editMenu.addItem(item("撤销", "undo:", "z"))
+        editMenu.addItem(item("重做", "redo:", "z", [.command, .shift]))
+        editMenu.addItem(.separator())
+        editMenu.addItem(item("剪切", "cut:", "x"))
+        editMenu.addItem(item("复制", "copy:", "c"))
+        editMenu.addItem(item("粘贴", "paste:", "v"))
+        editMenu.addItem(item("删除", "delete:", ""))
+        editMenu.addItem(.separator())
+        editMenu.addItem(item("全选", "selectAll:", "a"))
+        main.addItem(editItem)
+
+        // ── 窗口菜单 ──
+        let winItem = NSMenuItem()
+        let winMenu = NSMenu(title: "窗口")
+        winItem.submenu = winMenu
+        winMenu.addItem(item("最小化", "performMiniaturize:", "m"))
+        winMenu.addItem(item("关闭", "performClose:", "w"))
+        main.addItem(winItem)
+
+        NSApp.mainMenu = main
+    }
+
     // MARK: - 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1096,6 +1154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         backupSettings()
+        PasteboardSnapshot.logger = { Self.log("[pboard] \($0)") }
         baselineMB = Perf.residentMemoryMB()
         Self.log(String(format: "[selftest] 基线内存 %.1f MB", baselineMB))
 
@@ -1446,6 +1505,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 包括超时和失败——不然用户会发现自己的偏好被悄悄改掉了。
     private var settingsBackup: [String: Any] = [:]
     private var ballFrameBackup: String?
+
+    /// 临时：追踪剪贴板在各阶段之间的变化
+    private func traceClipboard(_ tag: String) {
+        let pb = NSPasteboard.general
+        let s = pb.string(forType: .string)
+        Self.log("[pboard] \(tag) → \(s.map { "「\($0.prefix(20))」(\($0.count)字)" } ?? "无文本") "
+               + "types=\(pb.types?.map { $0.rawValue }.prefix(3).joined(separator: ",") ?? "-")")
+    }
 
     private func backupSettings() {
         settingsBackup = [
@@ -1933,7 +2000,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         endContentDrag()
         panel.setFrame(NSRect(origin: originBefore, size: panel.frame.size), display: false)
 
-        finish(ok: problems.isEmpty, reason: problems.joined(separator: "; "))
+        stage18()
+    }
+
+    // MARK: 复制粘贴检查
+
+    private func stage18() {
+        traceClipboard("阶段18 开始")
+        guard !finished else { return }
+        Self.log("[selftest] 阶段18 · 复制粘贴")
+
+        // A. 主菜单里必须有「编辑」菜单 —— 这是剪贴板快捷键的唯一入口
+        guard let main = NSApp.mainMenu else {
+            problems.append("没有主菜单，⌘C/⌘V 没有入口")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+        let subItems = main.items.compactMap { $0.submenu?.items }.flatMap { $0 }
+        let pasteItem = subItems.first { $0.action == Selector(("paste:")) }
+        let copyItem = subItems.first { $0.action == Selector(("copy:")) }
+        Self.log("[selftest] 主菜单 \(main.items.count) 个顶级菜单；"
+               + "复制=⌘\(copyItem?.keyEquivalent.uppercased() ?? "无") "
+               + "粘贴=⌘\(pasteItem?.keyEquivalent.uppercased() ?? "无")")
+        if copyItem == nil { problems.append("主菜单里没有「复制」项") }
+        if pasteItem == nil { problems.append("主菜单里没有「粘贴」项，⌘V 没有入口") }
+
+        // B. 功能测试：真往编辑器里粘一段
+        guard let panel = NoteWindowManager.shared.panel(for: Self.selftestID),
+              let editor = NoteWindowManager.shared.editor(for: Self.selftestID) else {
+            problems.append("拿不到笔记窗口")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+
+        let pb = NSPasteboard.general
+        // 备份必须连图片 / 文件一起存。只存字符串的话，
+        // 用户剪贴板里是图片时 savedClip 为 nil，还原就成了「清空」。
+        let savedClipboard = PasteboardSnapshot.capture()
+        Self.log("[pboard] 阶段18 备份剪贴板 = \(savedClipboard.count) 项 "
+               + "\(savedClipboard.first?.keys.map(\.rawValue).joined(separator: ",") ?? "-")")
+        let token = "粘贴自检\(Int(Date().timeIntervalSince1970))"
+        pb.clearContents()
+        pb.setString(token, forType: .string)
+
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(editor.webView)
+        // 光把 WKWebView 设成 firstResponder 还不够 ——
+        // 网页里的可编辑区也得真的拿到焦点，paste: 才有落点。
+        // 真实使用时用户是「点进编辑区」完成的这一步，测试里得手动触发。
+        editor.focusEditor()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self else { return }
+
+            // 响应链上到底有没有人能处理 paste:（没有的话菜单项会是灰的）
+            let target = NSApp.target(forAction: Selector(("paste:")), to: nil, from: nil)
+            Self.log("[selftest] paste: 的响应者 = "
+                   + (target.map { String(describing: type(of: $0)) } ?? "无")
+                   + "；本 App 是否前台=\(NSApp.isActive) 窗口是否 key=\(panel.isKeyWindow)")
+
+            let focused = editor.evaluate("document.activeElement ? document.activeElement.className || document.activeElement.tagName : 'none'")
+            _ = focused
+
+            if target == nil { self.problems.append("响应链上没有对象能处理 paste:") }
+
+            NSApp.sendAction(Selector(("paste:")), to: nil, from: nil)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                editor.evaluate("document.querySelector('.tiptap, .bn-editor, .ProseMirror')?.innerText || ''") { text in
+                    let body = (text as? String) ?? ""
+                    let ok = body.contains(token)
+                    Self.log("[selftest] 粘贴结果：编辑器\(ok ? "已收到" : "没收到")「\(token)」")
+                    if !ok { self.problems.append("⌘V 粘贴没有进入编辑器") }
+
+                    // C. 复制回环：全选 → 复制 → 剪贴板里应该出现刚才粘进去的内容
+                    NSApp.sendAction(Selector(("selectAll:")), to: nil, from: nil)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        // 先清空，确认剪贴板里真的是这次复制写进去的
+                        pb.clearContents()
+                        NSApp.sendAction(Selector(("copy:")), to: nil, from: nil)
+
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                            let copied = pb.string(forType: .string) ?? ""
+                            let copiedOK = copied.contains(token)
+                            Self.log("[selftest] 复制回环：剪贴板\(copiedOK ? "已拿到" : "没拿到")"
+                                   + "编辑器内容（\(copied.count) 字符）")
+                            if !copiedOK { self.problems.append("⌘C 复制没有写进剪贴板") }
+
+                            // 原样还回去（含图片、文件等非文本类型）
+                            PasteboardSnapshot.restore(savedClipboard)
+                            Self.log("[pboard] 已还原剪贴板 \(savedClipboard.count) 项")
+
+                            self.finish(ok: self.problems.isEmpty,
+                                        reason: self.problems.joined(separator: "; "))
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private func finish(ok: Bool, reason: String) {

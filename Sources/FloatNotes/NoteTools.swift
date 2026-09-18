@@ -85,6 +85,44 @@ enum AttachmentGC {
     }
 }
 
+// MARK: - 剪贴板快照
+
+/// 临时代用剪贴板时必须原样还回去 —— 而且要连富文本、图片、文件
+/// 这些**非文本类型**一起还，只存一个字符串是不够的。
+enum PasteboardSnapshot {
+    typealias Items = [[NSPasteboard.PasteboardType: Data]]
+
+    /// 临时打开用来追时序
+    static var logger: ((String) -> Void)?
+
+    static func capture() -> Items {
+        let items = (NSPasteboard.general.pasteboardItems ?? []).map { item in
+            var dict: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let d = item.data(forType: type) { dict[type] = d }
+            }
+            return dict
+        }
+        logger?("capture \(items.count) 项 \(items.first?.keys.map(\.rawValue).joined(separator: ",") ?? "-")")
+        return items
+    }
+
+    static func restore(_ snapshot: Items) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        guard !snapshot.isEmpty else {
+            logger?("restore 跳过（快照为空）→ 剪贴板被清空")
+            return
+        }
+        pb.writeObjects(snapshot.map { dict -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in dict { item.setData(data, forType: type) }
+            return item
+        })
+        logger?("restore \(snapshot.count) 项 → 现在文本=\(pb.string(forType: .string)?.prefix(20) ?? "空")")
+    }
+}
+
 // MARK: - 导出
 
 enum NoteExporter {
