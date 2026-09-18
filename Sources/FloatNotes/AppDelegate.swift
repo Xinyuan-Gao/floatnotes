@@ -136,6 +136,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startWatchingNotes()
         installContentDragMonitor()
 
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "dev"
+        Self.log("[app] 构建 \(build) · \(Bundle.main.bundlePath)")
+
         Self.log("""
         ─────────────────────────────────────────────
          悬浮笔记 M1

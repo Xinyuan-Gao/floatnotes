@@ -28,9 +28,17 @@ cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/editor-src/dist/index.html" "$APP/Contents/Resources/editor/index.html"
 
+# 写进构建时间戳。之前被「到底开的是哪一版」坑过一次 ——
+# 磁盘上留着旧副本，光看外观分不出新旧。现在菜单栏「关于」里就能看到。
+STAMP="$(date +%Y%m%d.%H%M)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $STAMP" "$APP/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $STAMP" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $STAMP" "$APP/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $STAMP" "$APP/Contents/Info.plist"
+
 echo "▸ [4/4] ad-hoc 签名"
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 && echo "   签名完成" || echo "   签名跳过（自用无妨）"
 
 echo
-echo "✅ 打包完成：$APP"
+echo "✅ 打包完成：${APP}（构建 ${STAMP}）"
 du -sh "$APP" | awk '{print "   体积：" $1}'
