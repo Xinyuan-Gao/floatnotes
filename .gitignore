@@ -1,0 +1,20 @@
+# ── Swift / SPM ──────────────────────────────
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+
+# ── 前端 ─────────────────────────────────────
+node_modules/
+editor-src/dist/
+
+# ── 构建产物 ─────────────────────────────────
+dist/
+.iconbuild/
+*.iconset/
+
+# ── macOS ────────────────────────────────────
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>悬浮笔记编辑器</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fn-font-size: 16px;
+        --fn-font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+      }
+      html, body, #root { height: 100%; margin: 0; padding: 0; }
+      body { background: transparent; overflow: hidden; }
+
+      /* 收紧内边距，更适合小窗 */
+      .bn-container { height: 100%; }
+
+      /* ★ 必须覆盖 BlockNote 自己的 .bn-default-styles ——
+         它把 font-family 和 font-size 都写死在那里，
+         只改 .bn-editor 会被它盖掉（字体和字号都失效）。 */
+      .bn-default-styles,
+      .bn-editor {
+        font-family: var(--fn-font-family) !important;
+        font-size: var(--fn-font-size) !important;
+      }
+
+      /* 代码保持等宽，不受正文字体影响 */
+      .bn-inline-content code,
+      .bn-block-content[data-content-type="codeBlock"] {
+        font-family: Menlo, "PingFang SC", monospace !important;
+      }
+
+      .bn-editor {
+        padding-inline: 22px !important;
+        padding-bottom: 48px !important;
+      }
+
+      /* 让图片自适应窗口宽度 */
+      .bn-visual-media,
+      .bn-block-content[data-content-type="image"] img {
+        max-width: 100%;
+        height: auto;
+        border-radius: 6px;
+      }
+
+      /* 表格窄窗下可横向滚动，不撑破布局 */
+      .bn-block-content[data-content-type="table"] {
+        overflow-x: auto;
+      }
+
+      /* 滚动条收细 */
+      ::-webkit-scrollbar { width: 9px; height: 9px; }
+      ::-webkit-scrollbar-thumb {
+        background: rgba(128, 128, 128, 0.35);
+        border-radius: 5px;
+      }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, 0.55); }
+      ::-webkit-scrollbar-track { background: transparent; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
