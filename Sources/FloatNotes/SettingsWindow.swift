@@ -57,6 +57,8 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
 
                 Toggle("显示悬浮球", isOn: $model.showFloatingBall)
+                Text("随时按 ⌥⌘B 隐藏 / 显示；也可以右键悬浮球，或从菜单栏里切。")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("贴边位置", selection: $model.ballEdge) {
                     Text("屏幕右侧").tag("right")
                     Text("屏幕左侧").tag("left")

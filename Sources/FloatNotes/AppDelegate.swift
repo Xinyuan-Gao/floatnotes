@@ -241,6 +241,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggle.target = self
         menu.addItem(toggle)
 
+        let ball = NSMenuItem(
+            title: Settings.shared.showFloatingBall ? "隐藏悬浮球" : "显示悬浮球",
+            action: #selector(toggleFloatingBall), keyEquivalent: "b")
+        ball.keyEquivalentModifierMask = [.option, .command]
+        ball.target = self
+        menu.addItem(ball)
+
         let dock = NSMenuItem(
             title: Settings.shared.showInDock ? "✓ 在程序坞中显示图标" : "在程序坞中显示图标",
             action: #selector(toggleDockIcon), keyEquivalent: "")
@@ -356,14 +363,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
+    /// 自检用：悬浮球当前是否可见
+    var ballIsVisible: Bool { ballPanel?.isVisible ?? false }
+
+    private var lastBallEdge: String?
+
     /// 响应设置变化：显隐 + 贴边
     private func applyBallSettings() {
         guard let panel = ballPanel else { return }
-        if Settings.shared.showFloatingBall {
-            panel.orderFrontRegardless()
-            ballView?.applyEdge(animated: true)
-        } else {
+
+        guard Settings.shared.showFloatingBall else {
             panel.orderOut(nil)
+            return
+        }
+
+        let wasHidden = !panel.isVisible
+        panel.orderFrontRegardless()
+
+        // 只在「从隐藏恢复」或「贴边位置改了」的时候才重新吸附，
+        // 否则改个字体 / 透明度都会把球弹一下，很吵。
+        let edge = Settings.shared.ballEdge
+        if wasHidden || lastBallEdge != edge {
+            ballView?.applyEdge(animated: !wasHidden && lastBallEdge != nil)
+            lastBallEdge = edge
         }
     }
 
@@ -387,8 +409,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             GlobalHotKey(keyCode: Key.k, modifiers: Key.cmdOption) { [weak self] in self?.searchNotes() },
             GlobalHotKey(keyCode: Key.t, modifiers: Key.cmdOption) { [weak self] in self?.openTodayNote() },
             GlobalHotKey(keyCode: Key.g, modifiers: Key.cmdOption) { [weak self] in self?.openTriage() },
+            GlobalHotKey(keyCode: Key.b, modifiers: Key.cmdOption) { [weak self] in self?.toggleFloatingBall() },
         ].compactMap { $0 }
-        Self.log("[hotkey] 已注册 \(hotKeys.count)/8 个全局热键")
+        Self.log("[hotkey] 已注册 \(hotKeys.count)/9 个全局热键")
     }
 
     // MARK: - 动作
@@ -425,6 +448,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleAll() { NoteWindowManager.shared.toggleAll() }
     @objc private func collapseAll() { NoteWindowManager.shared.collapseAll() }
+
+    /// ⌥⌘B：隐藏 / 显示悬浮球
+    @objc private func toggleFloatingBall() {
+        Settings.shared.showFloatingBall.toggle()
+        let shown = Settings.shared.showFloatingBall
+        Self.log("[ball] 悬浮球已\(shown ? "显示" : "隐藏")（⌥⌘B 可切回）")
+        // 隐藏时给一次轻提示，免得用户以为功能坏了；显示时不用提示
+        if !shown {
+            CaptureToast.shared.show("悬浮球已隐藏 · ⌥⌘B 可切回", accent: .systemGray)
+        }
+    }
 
     @objc private func toggleDockIcon() {
         Settings.shared.showInDock.toggle()
@@ -1419,7 +1453,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if finalCount != 0 { problems.append("删除未清空（剩 \(finalCount)）") }
 
         cleanupAllTestNotes()
-        finish(ok: problems.isEmpty, reason: problems.joined(separator: "; "))
+        stage15()
+    }
+
+    // MARK: 悬浮球显隐检查
+
+    private func stage15() {
+        guard !finished else { return }
+        Self.log("[selftest] 阶段15 · 悬浮球隐藏 / 显示")
+
+        // 菜单构建路径平时测不到，这里主动跑一遍，确认开关确实在菜单里
+        let probe = NSMenu()
+        menuNeedsUpdate(probe)
+        let titles = probe.items.map(\.title)
+        let hasToggle = titles.contains { $0.contains("悬浮球") }
+        Self.log("[selftest] 菜单共 \(probe.items.count) 项，悬浮球开关存在 = \(hasToggle)")
+        if !hasToggle { problems.append("菜单里缺少悬浮球开关") }
+        if hidsOnDeactivateProbeMissing(probe) { problems.append("菜单缺少基础项") }
+
+        let original = Settings.shared.showFloatingBall
+        let startedVisible = ballIsVisible
+        Self.log("[selftest] 初始：showFloatingBall=\(original) 实际可见=\(startedVisible)")
+
+        // 隐藏
+        Settings.shared.showFloatingBall = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            let hidden = self.ballIsVisible
+            Self.log("[selftest] 设为隐藏后 → 实际可见=\(hidden)")
+            if hidden { self.problems.append("悬浮球未隐藏") }
+
+            // 再显示
+            Settings.shared.showFloatingBall = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                let shown = self.ballIsVisible
+                Self.log("[selftest] 设回显示后 → 实际可见=\(shown)")
+                if !shown { self.problems.append("悬浮球未恢复显示") }
+
+                // 还原初始值
+                Settings.shared.showFloatingBall = original
+                self.finish(ok: self.problems.isEmpty,
+                            reason: self.problems.joined(separator: "; "))
+            }
+        }
+    }
+
+    /// 菜单至少要有这些基础项
+    private func hidsOnDeactivateProbeMissing(_ menu: NSMenu) -> Bool {
+        let titles = menu.items.map(\.title)
+        let needed = ["新建笔记", "搜索笔记", "今日笔记"]
+        return !needed.allSatisfy { key in titles.contains { $0.contains(key) } }
     }
 
     private func finish(ok: Bool, reason: String) {
