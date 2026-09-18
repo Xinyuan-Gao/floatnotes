@@ -30,9 +30,14 @@ final class CaptureOverlay {
 
         // 一张窗口盖住所有屏幕的并集，省得每块屏各开一个
         let union = NSScreen.screens.reduce(NSRect.zero) { $0.union($1.frame) }
+        // ★ 用 nonactivatingPanel 且**不激活本 App**。
+        //   之前调了 NSApp.activate，对 regular 策略的 App 来说这会触发
+        //   macOS 切到它「所属」的 Space —— 于是用户在全屏 Space 里按截图，
+        //   人却被带到了另一个桌面，截到的也是那个桌面。
+        //   nonactivating 面板既能拿到键盘（esc / ↵ / 方向键），又不会激活 App。
         let panel = CaptureOverlayWindow(
             contentRect: union,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -54,8 +59,11 @@ final class CaptureOverlay {
 
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(v)
-        NSApp.activate(ignoringOtherApps: true)
         v.refreshTrackingAreas()
+
+        // 「不激活 App」是刻意为之，这里确认一下面板确实拿到了 key，
+        // 否则键盘操作（esc 取消等）会失灵。
+        NSLog("[CaptureOverlay] 面板 isKeyWindow=\(panel.isKeyWindow) 本App活跃=\(NSApp.isActive)")
     }
 
     private func finish(_ localRect: NSRect?) {
@@ -95,8 +103,12 @@ final class CaptureOverlay {
     func simulateConfirm() { view?.confirmCurrentSelection() }
 }
 
-/// 遮罩窗口：需要能成为 key 才能收到键盘
-final class CaptureOverlayWindow: NSWindow {
+/// 遮罩窗口。
+///
+/// 配了 `.nonactivatingPanel`，所以它能成为 key window 拿到键盘，
+/// 但**不会**让本 App 变成前台活跃应用 —— 这样才不会把用户所在的
+/// Space 切走（在别的桌面全屏时按截图，人应该留在原地）。
+final class CaptureOverlayWindow: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }

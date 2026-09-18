@@ -97,6 +97,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exit(0)
         }
 
+        // --overlay-probe [秒]：延迟若干秒后拉一次截图遮罩，并报告它在不在当前 Space。
+        // 用来排查「在别的桌面全屏时按截图，图跑到另一个桌面」这类问题。
+        if let i = CommandLine.arguments.firstIndex(of: "--overlay-probe") {
+            let delay = (i + 1 < CommandLine.arguments.count)
+                ? (Double(CommandLine.arguments[i + 1]) ?? 6.0) : 6.0
+            runOverlayProbe(after: delay)
+            return
+        }
+
         // --dom-probe：打印编辑器命中测试结果，用来确定「空白处」怎么判定
         if CommandLine.arguments.contains("--dom-probe") {
             runDOMProbe()
@@ -908,6 +917,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openNotesFolder() {
         NSWorkspace.shared.open(NoteStore.shared.root)
+    }
+
+    // MARK: - 遮罩 Space 探针
+
+    private func runOverlayProbe(after delay: Double) {
+        Self.log("[probe] \(Int(delay)) 秒后拉遮罩；当前前台 App = "
+               + "\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            let before = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+            Self.log("[probe] 拉遮罩前：前台=\(before) 本App活跃=\(NSApp.isActive)")
+
+            var afterOverlay = ""
+            var pinnedPanel: PinnedImagePanel?
+            var escCancelled = false
+
+            // ── 阶段1：验证「不激活 App」之后键盘还收不收得到 ──
+            // 这是改成 nonactivating 面板后最大的风险点：如果收不到键盘，
+            // esc / 回车就失灵了，用户只能靠点按钮。
+            var phase1Done = false
+            CaptureOverlay.shared.begin { rect in
+                if !phase1Done {
+                    phase1Done = true
+                    escCancelled = (rect == nil)
+                }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                Self.log("[probe] 阶段1 post 一个真实 esc…")
+                let src = CGEventSource(stateID: .combinedSessionState)
+                CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true)?
+                    .post(tap: .cghidEventTap)
+                CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: false)?
+                    .post(tap: .cghidEventTap)
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                    let closed = !CaptureOverlay.shared.isActive
+                    Self.log("[probe] 阶段1 结果：遮罩已关=\(closed) 收到取消回调=\(escCancelled) → "
+                           + (closed && escCancelled ? "键盘有效 ✅" : "键盘可能失灵 ⚠️"))
+
+                    Self.log("[probe] 阶段2：完整流程")
+                    startPhase2(&escCancelled)
+                }
+            }
+
+            func startPhase2(_ unused: inout Bool) {
+            CaptureOverlay.shared.begin { rect in
+                guard let rect else {
+                    Self.log("[probe] 遮罩被取消")
+                    return
+                }
+                Self.log("[probe] 确认选区 \(NSStringFromRect(rect))，开始截图")
+                let cg = ScreenCapture.screenPointRect(fromCocoa: rect)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+                    ScreenCapture.capture(rect: cg) { image in
+                        guard let image else {
+                            Self.log("[probe] 截取失败")
+                            return
+                        }
+                        let ns = NSImage(cgImage: image, size: rect.size)
+                        pinnedPanel = PinnedImageManager.shared.pin(ns, sourceRect: rect)
+                        Self.log("[probe] 已出图 \(image.width)×\(image.height) 像素")
+                    }
+                }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                afterOverlay = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+                let onScreen = Self.overlayWindowNumbersOnScreen()
+                let total = Self.overlayWindowNumbers()
+                Self.log("[probe] 遮罩：窗口号=\(total) 当前Space可见=\(onScreen) → "
+                       + (onScreen.isEmpty ? "不在当前 Space ⚠️" : "就在当前 Space ✅"))
+                Self.log("[probe] 拉遮罩后前台=\(afterOverlay)（拉之前是 \(before)）")
+
+                // 模拟一次框选并确认，走完整流程
+                CaptureOverlay.shared.simulateSelection(NSRect(x: 300, y: 300, width: 320, height: 220))
+                CaptureOverlay.shared.simulateConfirm()
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                let final = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+                let pinnedOnScreen = Self.overlayWindowNumbersOnScreen()
+                let overlayGone = !CaptureOverlay.shared.isActive
+                Self.log("[probe] 出图后：前台=\(final) 遮罩已关闭=\(overlayGone) "
+                       + "固定图数量=\(PinnedImageManager.shared.count)")
+                Self.log("[probe] 当前 Space 可见的自家窗口号=\(pinnedOnScreen)")
+                Self.log("[probe] ★ 前台是否被抢 = " + (final == before ? "否 ✅" : "是（\(before) → \(final)）⚠️"))
+
+                PinnedImageManager.shared.closeAll()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { exit(0) }
+            }
+            }   // startPhase2
+        }
+    }
+
+    /// 我们所有的窗口号
+    private static func overlayWindowNumbers() -> [Int] {
+        NSApp.windows.filter { $0.isVisible }.map { $0.windowNumber }
+    }
+
+    /// 这些窗口号里，有哪些出现在「当前 Space 的屏幕上」
+    private static func overlayWindowNumbersOnScreen() -> [Int] {
+        let mine = Set(overlayWindowNumbers())
+        let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+        return list.compactMap { w -> Int? in
+            guard let n = w[kCGWindowNumber as String] as? Int, mine.contains(n) else { return nil }
+            return n
+        }
     }
 
     // MARK: - DOM 探针
