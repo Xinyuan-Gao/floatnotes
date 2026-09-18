@@ -187,17 +187,20 @@ final class PinnedImageManager {
 
     // MARK: 尺寸与摆放
 
-    /// 图片初始尺寸：不超过该屏幕的 45% 宽、55% 高
+    /// 图片初始尺寸：**默认按原尺寸 1:1 显示**，只有超出屏幕才等比缩小。
+    ///
+    /// 之前是压到屏幕 45% —— 那样截出来的图会比实际小一圈，
+    /// 对照原文时会觉得「图变了」。钉在屏幕上的意义就是它和原内容一模一样。
     private func fittedSize(for image: NSImage) -> NSSize {
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxW = screen.width * 0.45
-        let maxH = screen.height * 0.55
         let src = image.size
         guard src.width > 0, src.height > 0 else { return NSSize(width: 300, height: 200) }
 
+        let maxW = screen.width * 0.86
+        let maxH = screen.height * 0.86
         let scale = min(1, maxW / src.width, maxH / src.height)
-        return NSSize(width: max(120, src.width * scale),
-                      height: max(80, src.height * scale))
+        return NSSize(width: max(80, src.width * scale),
+                      height: max(60, src.height * scale))
     }
 
     /// 摆放在截取区域旁边；放不下就错开叠放

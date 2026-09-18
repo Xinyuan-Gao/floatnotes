@@ -2208,19 +2208,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             finish(ok: problems.isEmpty, reason: problems.joined(separator: "; ")); return
         }
 
-        // B. 框选遮罩能不能正常起来
-        CaptureOverlay.shared.begin { _ in }
+        // B. 框选遮罩：验证「拖出选区 → 还能移动/改大小 → 确认才截」这套交互
+        CaptureOverlay.shared.begin { [weak self] rect in
+            // 取消时 rect 为 nil；这里只记录，具体断言在 stage19Overlay 里做
+            self?.confirmedRect = rect
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.stage19Overlay()
         }
     }
+
+    private var confirmedRect: NSRect?
 
     private func stage19Overlay() {
         guard !finished else { return }
         let active = CaptureOverlay.shared.isActive
         Self.log("[selftest] 框选遮罩可见 = \(active)")
         if !active { problems.append("框选遮罩没有显示出来") }
-        CaptureOverlay.shared.cancel()
+
+        // 模拟：从 (200,300) 拖到 (500,500)，得到 300×200 的选区
+        let from = NSPoint(x: 200, y: 300)
+        let to = NSPoint(x: 500, y: 500)
+        CaptureOverlay.shared.simulateMouse(.leftMouseDown, at: from)
+        CaptureOverlay.shared.simulateMouse(.leftMouseDragged, at: to)
+        CaptureOverlay.shared.simulateMouse(.leftMouseUp, at: to)
+
+        guard let created = CaptureOverlay.shared.currentSelection else {
+            problems.append("拖拽没有产生选区")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+        Self.log("[selftest] 拖出的选区 = \(NSStringFromRect(created))")
+
+        // ★ 关键：松手之后不能立刻截图，得把选区留着让用户继续调
+        if !CaptureOverlay.shared.isActive {
+            problems.append("松手就立刻截图了，没给调整的机会")
+        } else {
+            Self.log("[selftest] 松手后遮罩仍在，可以继续调整 ✓")
+        }
+
+        // 拖动选区整体：从选区内部 (350,400) 拖到 (390,430)，应整体位移 (40,30)
+        let grab = NSPoint(x: 350, y: 400)
+        let drop = NSPoint(x: 390, y: 430)
+        CaptureOverlay.shared.simulateMouse(.leftMouseDown, at: grab)
+        CaptureOverlay.shared.simulateMouse(.leftMouseDragged, at: drop)
+        CaptureOverlay.shared.simulateMouse(.leftMouseUp, at: drop)
+
+        guard let moved = CaptureOverlay.shared.currentSelection else {
+            problems.append("移动后选区丢了")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+        let dx = moved.origin.x - created.origin.x
+        let dy = moved.origin.y - created.origin.y
+        Self.log(String(format: "[selftest] 整体拖动位移 = (%.0f, %.0f)，期望 (40, 30)", dx, dy))
+        if abs(dx - 40) > 1 || abs(dy - 30) > 1 {
+            problems.append(String(format: "选区拖动不对（%.0f, %.0f）", dx, dy))
+        }
+        if abs(moved.width - created.width) > 1 || abs(moved.height - created.height) > 1 {
+            problems.append("拖动时选区尺寸不该变")
+        }
+
+        // 拉右下角把手。注意 y 轴向上：想让选区「变大」要往右下拖，
+        // 也就是 y 变小 —— 反了的话底边会越过顶边，被最小边长挡住。
+        let corner = NSPoint(x: moved.maxX, y: moved.minY)
+        let target = NSPoint(x: moved.maxX + 60, y: moved.minY - 70)
+        CaptureOverlay.shared.simulateMouse(.leftMouseDown, at: corner)
+        CaptureOverlay.shared.simulateMouse(.leftMouseDragged, at: target)
+        CaptureOverlay.shared.simulateMouse(.leftMouseUp, at: target)
+
+        guard let resized = CaptureOverlay.shared.currentSelection else {
+            problems.append("拉把手后选区丢了")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+        let grewW = resized.width - moved.width
+        let grewH = resized.height - moved.height
+        Self.log(String(format: "[selftest] 拉右下角后尺寸 %.0f×%.0f（原 %.0f×%.0f，增加 %.0f×%.0f）",
+                        resized.width, resized.height, moved.width, moved.height, grewW, grewH))
+        if grewW <= 1 || grewH <= 1 { problems.append("拉把手没有改变选区大小") }
+        // 拉右下角时，该动的是底边和右边；左上角（minX / maxY）必须钉住
+        if abs(resized.minX - moved.minX) > 1 || abs(resized.maxY - moved.maxY) > 1 {
+            problems.append(String(format: "拉右下角把手把左上角也带跑了（%.0f,%.0f → %.0f,%.0f）",
+                                   moved.minX, moved.maxY, resized.minX, resized.maxY))
+        }
+
+        // 确认之后才真的出图
+        let expected = resized
+        CaptureOverlay.shared.simulateConfirm()
+        if CaptureOverlay.shared.isActive {
+            problems.append("确认之后遮罩没有关闭")
+        }
+
+        // 把「确认时的选区」记下来，下一步用它去截
+        confirmedRect = expected
+        Self.log("[selftest] 确认的最终选区 = \(NSStringFromRect(expected))")
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             self?.stage19Capture()
         }
