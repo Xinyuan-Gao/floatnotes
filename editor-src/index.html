@@ -10,8 +10,15 @@
         --fn-font-size: 16px;
         --fn-font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
       }
-      html, body, #root { height: 100%; margin: 0; padding: 0; }
-      body { background: transparent; overflow: hidden; }
+      /* ★ 滚动容器必须是 .bn-container，不能让它逃到 html 上。
+         之前 body 设了 overflow:hidden 而 .bn-container 是 overflow:visible，
+         溢出全跑到 html —— 结果是「程序化 scrollTop 能滚，真实滚轮滚不动」。
+         实测发真实 scrollWheel 事件，滚动前后 scrollTop 都是 0。 */
+      html, body, #root {
+        height: 100%; margin: 0; padding: 0;
+        overflow: hidden;
+      }
+      body { background: transparent; }
 
       /* ── 笔记背景 ────────────────────────────────────────
          图片铺满窗口，上面压一层很淡的护罩保证正文对比度。
@@ -43,8 +50,12 @@
         background-color: transparent !important;
       }
 
-      /* 收紧内边距，更适合小窗 */
-      .bn-container { height: 100%; }
+      /* 收紧内边距，更适合小窗；同时由它承担滚动 */
+      .bn-container {
+        height: 100%;
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
 
       /* ★ 必须覆盖 BlockNote 自己的 .bn-default-styles ——
          它把 font-family 和 font-size 都写死在那里，

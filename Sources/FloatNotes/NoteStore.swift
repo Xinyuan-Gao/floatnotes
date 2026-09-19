@@ -132,6 +132,25 @@ final class NoteStore {
         dirty.removeValue(forKey: id)
     }
 
+    // MARK: - 图片路径的两种形态
+    //
+    // 编辑器里图片用的是自定义 scheme：floatnotes://media/<文件名>
+    //   —— 只有本 App 在跑的时候才解析得了。
+    // 但写进 .md 的必须是**相对路径** attachments/<文件名>，
+    //   —— 这样 Obsidian / VS Code / 任何 Markdown 编辑器都能显示，
+    //      笔记换台机器、发给别人也不会丢图。
+    //
+    // 之前直接把 floatnotes:// 写进了 md：在本 App 里自测一切正常，
+    // 但用别的编辑器打开就是死链，看着像「图片没保存」。
+
+    static func toDiskForm(_ markdown: String) -> String {
+        markdown.replacingOccurrences(of: "floatnotes://media/", with: "attachments/")
+    }
+
+    static func toEditorForm(_ markdown: String) -> String {
+        markdown.replacingOccurrences(of: "attachments/", with: "floatnotes://media/")
+    }
+
     // MARK: - 读
 
     func load(_ id: String) -> String {
@@ -220,7 +239,7 @@ final class NoteStore {
     // MARK: - 写（防抖）
 
     func scheduleSave(_ id: String, markdown: String) {
-        dirty[id] = markdown
+        dirty[id] = Self.toDiskForm(markdown)
         flushTimer?.invalidate()
         flushTimer = Timer.scheduledTimer(withTimeInterval: debounce, repeats: false) { [weak self] _ in
             self?.flush()

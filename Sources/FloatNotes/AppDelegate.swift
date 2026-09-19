@@ -129,6 +129,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exit(trusted ? 0 : 1)
         }
 
+        // --paste-probe：走完整的「粘贴图片 → 自动保存 → 读 md」链路
+        if CommandLine.arguments.contains("--paste-probe") {
+            runPasteProbe()
+            return
+        }
+
+        // --note-probe：诊断「滚动」与「图片进 md」两个问题
+        if CommandLine.arguments.contains("--note-probe") {
+            runNoteProbe()
+            return
+        }
+
         // --overlay-probe [秒]：延迟若干秒后拉一次截图遮罩，并报告它在不在当前 Space。
         // 用来排查「在别的桌面全屏时按截图，图跑到另一个桌面」这类问题。
         if let i = CommandLine.arguments.firstIndex(of: "--overlay-probe") {
@@ -154,6 +166,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         isSelfTest = CommandLine.arguments.contains("--selftest")
+
+        // 放在 setupFloatingBall() 之前：要先还完账，球的显隐才会读对设置
+        recoverInterruptedSelftest()
 
         NoteWindowManager.shared.onLog = { msg in Self.log(msg) }
 
@@ -1046,6 +1061,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(NoteStore.shared.root)
     }
 
+    // MARK: - 笔记滚动 / 图片导出探针
+
+    private func runNoteProbe() {
+        let size = NSSize(width: 420, height: 340)   // 故意用小窗，制造溢出
+        let panel = NotePanel(noteID: "探针", frame: NSRect(origin: .zero, size: size))
+        let editor = WebEditorView(frame: NSRect(origin: .zero, size: size))
+        panel.contentView = editor
+        panel.orderFrontRegardless()
+
+        var tall = "# 滚动测试\n\n"
+        for i in 1...25 { tall += "第 \(i) 行内容，用来把窗口撑出滚动条。\n\n" }
+
+        editor.onReady = {
+            editor.load(markdown: tall)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                Self.log("[note-probe] ── A. 结构度量 ──")
+                editor.evaluate("window.FloatNotes._scrollInfo()") { r in
+                    Self.log("[note-probe] \(r ?? "nil")")
+                    self.probeRealScroll(panel: panel, editor: editor)
+                }
+            }
+        }
+    }
+
+    /// 真实滚轮测试：把窗口挪到鼠标底下（不动用户光标），
+    /// 发一个真的 scrollWheel 事件，看内容有没有滚。
+    private func probeRealScroll(panel: NotePanel, editor: WebEditorView) {
+        let mouse = NSEvent.mouseLocation
+        panel.setFrameOrigin(NSPoint(x: mouse.x - panel.frame.width / 2,
+                                     y: mouse.y - panel.frame.height / 2))
+        panel.makeKey()
+        panel.makeFirstResponder(editor.webView)
+        editor.focusEditor()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            editor.evaluate("document.querySelector('.bn-container').scrollTop + '|' + document.documentElement.scrollTop") { before in
+                let b = (before as? String) ?? "?"
+                Self.log("[note-probe] ── B. 真实滚轮 ──")
+                Self.log("[note-probe] 滚动前 container|html = \(b)")
+
+                // 发一个真实的滚轮事件（向下滚）
+                let src = CGEventSource(stateID: .combinedSessionState)
+                if let e = CGEvent(scrollWheelEvent2Source: src, units: .pixel,
+                                   wheelCount: 1, wheel1: -120, wheel2: 0, wheel3: 0) {
+                    e.post(tap: .cghidEventTap)
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    editor.evaluate("document.querySelector('.bn-container').scrollTop + '|' + document.documentElement.scrollTop") { after in
+                        let a = (after as? String) ?? "?"
+                        Self.log("[note-probe] 滚动后 container|html = \(a)")
+                        Self.log("[note-probe] 结论 = " + (a == b ? "★ 真实滚轮无效（复现了问题）" : "有效"))
+                        self.probeMarkdown(editor: editor)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 图片能不能进 markdown
+    private func probeMarkdown(editor: WebEditorView) {
+        Self.log("[note-probe] ── C. 图片进 markdown ──")
+        editor.evaluate("window.FloatNotes._insertImage('floatnotes://media/probe-test.png','探针图')") { _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                editor.evaluate("window.FloatNotes._startMarkdownExport()") { _ in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        editor.evaluate("window.__fnMd ? window.__fnMd.value : 'null'") { md in
+                            let text = (md as? String) ?? "null"
+                            let hasImg = text.contains("probe-test.png")
+                            Self.log("[note-probe] markdown 里含图片引用 = \(hasImg)")
+                            Self.log("[note-probe] markdown 片段:\n----\n\(text.suffix(500))\n----")
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 粘贴 → 存盘 探针
+
+    private func runPasteProbe() {
+        let id = "探针粘贴"
+        NoteStore.shared.delete(id)
+        NoteWindowManager.shared.open(id)
+
+        // 等窗口和编辑器就绪
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            guard let panel = NoteWindowManager.shared.panel(for: id),
+                  let editor = NoteWindowManager.shared.editor(for: id) else {
+                Self.log("[paste-probe] ✗ 拿不到窗口"); exit(1)
+            }
+            Self.log("[paste-probe] 窗口就绪")
+
+            // 造一张小图放剪贴板（和用户复制截图等价）
+            let img = NSImage(size: NSSize(width: 60, height: 40))
+            img.lockFocus()
+            NSColor.systemTeal.setFill()
+            NSRect(x: 0, y: 0, width: 60, height: 40).fill()
+            img.unlockFocus()
+            ScreenCapture.copyToPasteboard(img)
+
+            panel.makeKeyAndOrderFront(nil)
+            panel.makeFirstResponder(editor.webView)
+            editor.focusEditor()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                Self.log("[paste-probe] 发送 ⌘V")
+                NSApp.sendAction(Selector(("paste:")), to: nil, from: nil)
+
+                // 防抖 0.4s，多等一会儿
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    NoteStore.shared.flush()
+                    let md = NoteStore.shared.load(id)
+                    let hasRel = md.contains("](attachments/")
+                    let hasScheme = md.contains("floatnotes://media/")
+                    Self.log("[paste-probe] ── 结果 ──")
+                    Self.log("[paste-probe] 落盘 \(md.count) 字符")
+                    Self.log("[paste-probe] 用相对路径 attachments/ = \(hasRel)；"
+                           + "残留自定义 scheme = \(hasScheme)（应为 false）")
+                    Self.log("[paste-probe] md 原文:\n····\n\(md)\n····")
+                    Self.log("[paste-probe] 附件目录: "
+                           + "\(NoteStore.shared.attachmentNames().sorted().joined(separator: ", "))")
+                    NoteWindowManager.shared.close(id)
+                    NoteStore.shared.delete(id)
+                    for n in NoteStore.shared.attachmentNames() {
+                        NoteStore.shared.deleteAttachment(n)
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) }
+                }
+            }
+        }
+    }
+
     // MARK: - 遮罩 Space 探针
 
     private func runOverlayProbe(after delay: Double) {
@@ -1855,6 +2005,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "noteBackground": Settings.shared.noteBackground,
         ]
         ballFrameBackup = UserDefaults.standard.string(forKey: "ballFrame")
+
+        // 光放在内存里不够：自检要是被强杀（崩溃、Ctrl+C、超时 kill），
+        // finish() 就跑不到，用户的设置会被永久改掉 —— 之前就真出过这事。
+        // 所以落一份盘，并留个「还没还原」的标记，下次启动先把欠的账还上。
+        let d = UserDefaults.standard
+        d.set(settingsBackup, forKey: Self.backupKey)
+        d.set(ballFrameBackup, forKey: Self.backupBallFrameKey)
+        d.set(true, forKey: Self.backupPendingKey)
+        d.synchronize()
     }
 
     private func restoreSettings() {
@@ -1870,6 +2029,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let r = NSRectFromString(f)
             if r.width > 10 { ballPanel?.setFrame(r, display: false) }
         }
+        clearSettingsBackup()
+    }
+
+    private static let backupKey = "selftest.settingsBackup"
+    private static let backupBallFrameKey = "selftest.ballFrameBackup"
+    private static let backupPendingKey = "selftest.backupPending"
+
+    private func clearSettingsBackup() {
+        let d = UserDefaults.standard
+        d.removeObject(forKey: Self.backupKey)
+        d.removeObject(forKey: Self.backupBallFrameKey)
+        d.removeObject(forKey: Self.backupPendingKey)
+        d.synchronize()
+    }
+
+    /// 上次自检没走到还原就退出了？启动时先把设置还回去。
+    /// 正常启动时这个标记不存在，等于什么都不做。
+    private func recoverInterruptedSelftest() {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: Self.backupPendingKey) else { return }
+        guard let saved = d.dictionary(forKey: Self.backupKey) else {
+            clearSettingsBackup()
+            return
+        }
+        Self.log("[selftest] 检测到上次自检异常中断，先把被改动的设置还原回来")
+        settingsBackup = saved
+        ballFrameBackup = d.string(forKey: Self.backupBallFrameKey)
+        restoreSettings()
     }
 
     private var originalFontFamily: String?
@@ -2563,10 +2750,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// C. 截取 —— 拿悬浮球当参照物：它位置已知、颜色又很好认，
     ///    正好用来验证「Cocoa 坐标 → 屏幕点坐标」这步换算对不对。
-    private func stage19Capture() {
+    private func stage19Capture(rescued: Bool = false) {
         guard !finished else { return }
-        guard let ball = ballPanel, ball.isVisible else {
-            problems.append("悬浮球不可见，无法验证截取坐标系")
+
+        // 悬浮球在这里只是「参照物」：位置已知、颜色好认，用来验证坐标换算。
+        // 但用户完全可能把它隐藏了（⌥⌘B），那是合法状态，不该让自检误报失败。
+        // 所以先临时把它亮出来，跑完由 finish() 连设置一起还原。
+        if ballPanel?.isVisible != true {
+            guard !rescued else {
+                problems.append("悬浮球显示不出来，无法验证截取坐标系")
+                finish(ok: false, reason: problems.joined(separator: "; ")); return
+            }
+            Self.log("[selftest] 悬浮球当前是隐藏的，临时显示一下作为坐标参照（你的设置稍后会还原）")
+            Settings.shared.showFloatingBall = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.stage19Capture(rescued: true)
+            }
+            return
+        }
+
+        guard let ball = ballPanel else {
+            problems.append("悬浮球面板不存在，无法验证截取坐标系")
             finish(ok: false, reason: problems.joined(separator: "; ")); return
         }
 
@@ -2812,8 +3016,176 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         // 恢复成用户原本的设置
                         let original = Settings.shared.noteBackground
                         ed.setBackground(original, isDark: BackgroundCatalog.isDark(original))
-                        self.finish(ok: self.problems.isEmpty,
-                                    reason: self.problems.joined(separator: "; "))
+                        self.stage21()
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: 滚动 + 图片往返检查
+    //
+    // 这两个都是「自测全绿但实际用不了」的典型：
+    //   · 滚动：程序化 scrollTop 能滚，真实滚轮滚不动（溢出逃到了 html）
+    //   · 图片：本 App 里显示正常，但 md 里写的是自定义 scheme，别处打不开
+    // 所以这里都按「真实行为」验，不按结构验。
+
+    private func stage21() {
+        guard !finished else { return }
+        Self.log("[selftest] 阶段21 · 滚动与图片往返")
+
+        // A. 路径转换（纯函数，先验这个便宜的）
+        let sample = "![a](floatnotes://media/a.png) 和 ![](attachments/b.png)"
+        let disk = NoteStore.toDiskForm(sample)
+        let back = NoteStore.toEditorForm(disk)
+        Self.log("[selftest] 落盘形态: \(disk)")
+        if disk.contains("floatnotes://media/") {
+            problems.append("落盘后仍残留自定义 scheme，别的编辑器打不开")
+        }
+        if !disk.contains("attachments/a.png") { problems.append("没转成相对路径") }
+        if !back.contains("floatnotes://media/a.png") { problems.append("载入时没换回 scheme") }
+
+        // B. 滚动：先塞长文，等排版稳定，再上真实滚轮。
+        //    顺序很关键 —— 之前是先测结构再加载长文，测到的是旧内容（scrollH == clientH），
+        //    于是「滚不动」既可能是真回归、也可能只是没内容可滚，报错信息根本没法定位。
+        guard let panel = NoteWindowManager.shared.panel(for: Self.selftestID),
+              let ed = NoteWindowManager.shared.editor(for: Self.selftestID) else {
+            problems.append("拿不到笔记窗口，无法验证滚动")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+
+        var tall = "# 滚动自检\n\n"
+        for i in 1...60 { tall += "第 \(i) 行，用来把窗口撑出滚动范围。\n\n" }
+        ed.load(markdown: tall)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self else { return }
+            ed.evaluate("window.FloatNotes._scrollInfo()") { r in
+                let info = (r as? String) ?? "null"
+                Self.log("[selftest] 滚动结构（长文加载后）: \(info)")
+
+                var containerScrolls = false
+                var canScroll = false
+                if let d = info.data(using: .utf8),
+                   let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                   let c = o["container"] as? [String: Any] {
+                    containerScrolls = (c["overflowY"] as? String) == "auto"
+                    canScroll = (c["canScroll"] as? Bool) ?? false
+                }
+                if !containerScrolls {
+                    self.problems.append("滚动容器不是 .bn-container（溢出会逃到 html，滚轮会失灵）")
+                }
+                // 长文都撑不出一像素的可滚高度，说明容器的 height 没被真正约束住，
+                // 内容会被 html{overflow:hidden} 裁掉看不见 —— 这是产品 bug，不是环境问题。
+                if !canScroll {
+                    self.problems.append("内容已超出窗口，容器却无可滚高度（高度没约束住，内容会被裁掉）")
+                }
+                self.stage21Wheel(panel: panel, ed: ed)
+            }
+        }
+    }
+
+    private func stage21Wheel(panel: NotePanel, ed: WebEditorView) {
+        guard !finished else { return }
+
+        let savedFrame = panel.frame
+        let mouse = NSEvent.mouseLocation
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            // 把窗口挪到鼠标底下 —— 这样不用移动用户的光标也能收到滚轮事件
+            panel.setFrameOrigin(NSPoint(x: mouse.x - panel.frame.width / 2,
+                                         y: mouse.y - panel.frame.height / 2))
+            panel.makeKey()
+            panel.makeFirstResponder(ed.webView)
+            ed.focusEditor()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                ed.evaluate("""
+                (() => {
+                  const c = document.querySelector('.bn-container');
+                  return JSON.stringify({ top: c.scrollTop, max: c.scrollHeight - c.clientHeight });
+                })()
+                """) { before in
+                    var b = -1.0, maxScroll = -1.0
+                    if let s = before as? String, let d = s.data(using: .utf8),
+                       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                        b = (o["top"] as? NSNumber)?.doubleValue ?? -1
+                        maxScroll = (o["max"] as? NSNumber)?.doubleValue ?? -1
+                    }
+
+                    let src = CGEventSource(stateID: .combinedSessionState)
+                    CGEvent(scrollWheelEvent2Source: src, units: .pixel,
+                            wheelCount: 1, wheel1: -120, wheel2: 0, wheel3: 0)?
+                        .post(tap: .cghidEventTap)
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        ed.evaluate("document.querySelector('.bn-container').scrollTop") { after in
+                            let a = (after as? NSNumber)?.doubleValue ?? -1
+                            Self.log(String(format: "[selftest] 真实滚轮: scrollTop %.0f → %.0f（可滚上限 %.0f）",
+                                            b, a, maxScroll))
+                            if a <= b {
+                                // 区分两种完全不同的故障：没东西可滚，还是滚轮没送达。
+                                // 混在一起报会把人引向错误的方向。
+                                if maxScroll <= 0 {
+                                    self.problems.append("滚轮没移动，但本来也没有可滚内容（测试前提不成立）")
+                                } else {
+                                    self.problems.append("有 \(Int(maxScroll))px 可滚内容，真实滚轮却没送达（这正是不该漏掉的回归）")
+                                }
+                            }
+                            // 还原窗口位置
+                            panel.setFrame(savedFrame, display: true)
+                            self.stage21Image(panel: panel, ed: ed)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// C. 图片在编辑器 ↔ md 之间的往返
+    private func stage21Image(panel: NotePanel, ed: WebEditorView) {
+        guard !finished else { return }
+
+        ed.load(markdown: "# 图片往返\n\n")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            ed.evaluate("window.FloatNotes._insertImage('floatnotes://media/roundtrip.png','往返测试')") { _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    ed.evaluate("window.FloatNotes._startMarkdownExport()") { _ in
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                            ed.evaluate("window.__fnMd ? window.__fnMd.value : 'null'") { md in
+                                let text = (md as? String) ?? "null"
+                                let diskForm = NoteStore.toDiskForm(text)
+                                let backForm = NoteStore.toEditorForm(diskForm)
+
+                                Self.log("[selftest] 编辑器导出: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
+                                Self.log("[selftest] 变成落盘形态: \(diskForm.trimmingCharacters(in: .whitespacesAndNewlines))")
+
+                                if !text.contains("floatnotes://media/roundtrip.png") {
+                                    self.problems.append("编辑器导出的 md 里没有图片引用")
+                                }
+                                if !diskForm.contains("attachments/roundtrip.png") {
+                                    self.problems.append("落盘形态没有相对路径")
+                                }
+                                if !backForm.contains("floatnotes://media/roundtrip.png") {
+                                    self.problems.append("载入形态没换回自定义 scheme")
+                                }
+
+                                // 真跑一遍：写进文件再读回来，确认往返一致
+                                let id = "往返自检"
+                                NoteStore.shared.replaceAll(id, with: diskForm)
+                                let reloaded = NoteStore.shared.load(id)
+                                let forEditor = NoteStore.toEditorForm(reloaded)
+                                Self.log("[selftest] 落盘后读回并转换: "
+                                       + "\(forEditor.contains("floatnotes://media/roundtrip.png") ? "图片引用完好 ✅" : "丢了 ⚠️")")
+                                if !forEditor.contains("floatnotes://media/roundtrip.png") {
+                                    self.problems.append("存盘再读回后图片引用丢了")
+                                }
+                                NoteStore.shared.delete(id)
+
+                                self.finish(ok: self.problems.isEmpty,
+                                            reason: self.problems.joined(separator: "; "))
+                            }
+                        }
                     }
                 }
             }

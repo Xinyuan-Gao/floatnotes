@@ -221,6 +221,69 @@ function App() {
         const fn = pendingUploads.get(id);
         if (fn) fn(filename);
       },
+      // 自检用：导出真正的 markdown（落盘用的就是它）
+      _startMarkdownExport() {
+        window.__fnMd = { done: false, value: null };
+        (async () => {
+          try {
+            const v = await editor.blocksToMarkdownLossy(editor.document);
+            window.__fnMd = { done: true, value: v || "" };
+          } catch (e) {
+            window.__fnMd = { done: true, value: "ERR " + e };
+          }
+        })();
+        return "started";
+      },
+
+      // 自检用：插入一个图片块
+      _insertImage(url, caption) {
+        const block = { type: "image", props: { url, caption: caption || "" } };
+        let ref = null;
+        try { ref = editor.getTextCursorPosition().block; } catch (e) { ref = null; }
+        if (!ref) ref = editor.document[editor.document.length - 1];
+        if (ref) editor.insertBlocks([block], ref, "after");
+        else editor.replaceBlocks(editor.document, [block]);
+        return "inserted";
+      },
+
+      // 自检用：滚动相关度量
+      _scrollInfo() {
+        const pick = (sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return null;
+          const cs = getComputedStyle(el);
+          return {
+            sel,
+            overflowY: cs.overflowY,
+            scrollH: el.scrollHeight,
+            clientH: el.clientHeight,
+            canScroll: el.scrollHeight > el.clientHeight + 2,
+          };
+        };
+        return JSON.stringify({
+          html: pick("html"),
+          body: pick("body"),
+          container: pick(".bn-container"),
+          editor: pick(".bn-editor"),
+          viewportH: window.innerHeight,
+        });
+      },
+
+      // 自检用：真的滚一下，返回滚动前后的 scrollTop
+      _tryScroll(delta) {
+        const cands = [".bn-container", ".bn-editor", "body", "html"];
+        for (const sel of cands) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          const before = el.scrollTop;
+          el.scrollTop = before + delta;
+          if (el.scrollTop !== before) {
+            return JSON.stringify({ ok: true, sel, before, after: el.scrollTop });
+          }
+        }
+        return JSON.stringify({ ok: false, reason: "没有元素能滚动" });
+      },
+
       // 自检用：验证背景图能不能经 floatnotes://bg/ 取到
       _startBgProbe(key) {
         window.__fnBg = { done: false, ok: false, w: 0, h: 0 };
@@ -380,8 +443,29 @@ function App() {
       insertImageBlock(`floatnotes://media/${name}`);
     };
 
+    // 拖拽图片进来走的是另一条路（drop 而不是 paste），
+    // BlockNote 自己那套会建成「文件附件」块。这里一并接管，保持和粘贴一致。
+    const onDrop = async (e) => {
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      const files = Array.from(dt.files || []);
+      const img = files.find((f) => looksLikeImage({ type: f.type }, f));
+      if (!img) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      const name = await requestUpload(img);
+      if (!name) return;
+      insertImageBlock(`floatnotes://media/${name}`);
+    };
+
     document.addEventListener("paste", onPaste, true);
-    return () => document.removeEventListener("paste", onPaste, true);
+    document.addEventListener("drop", onDrop, true);
+    return () => {
+      document.removeEventListener("paste", onPaste, true);
+      document.removeEventListener("drop", onDrop, true);
+    };
   }, [editor]);
 
   // 主题覆盖

@@ -69,10 +69,11 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
         editor.onReady = { [weak editor, weak panel] in
             if let prefill {
                 // 划词新建：直接灌入预填内容并立刻落盘
-                editor?.load(markdown: prefill)
+                editor?.load(markdown: NoteStore.toEditorForm(prefill))
                 NoteStore.shared.scheduleSave(id, markdown: prefill)
             } else {
-                editor?.load(markdown: NoteStore.shared.load(id))
+                // 磁盘上是相对路径，交给编辑器要换成 floatnotes://
+                editor?.load(markdown: NoteStore.toEditorForm(NoteStore.shared.load(id)))
             }
             editor?.setFontSize(Settings.shared.noteFontSize)
             editor?.setFontFamily(FontCatalog.css(for: Settings.shared.noteFontFamily))
@@ -237,7 +238,7 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
             let disk = NoteStore.shared.load(id)
             if NoteStore.shared.lastWrittenContent(id) == disk { continue }
 
-            editor.load(markdown: disk)
+            editor.load(markdown: NoteStore.toEditorForm(disk))
             reloaded.append(id)
         }
         if !skipped.isEmpty {
