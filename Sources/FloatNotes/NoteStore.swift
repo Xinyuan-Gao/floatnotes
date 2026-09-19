@@ -112,6 +112,18 @@ final class NoteStore {
         return true
     }
 
+    /// 建一个**空**笔记文件（新建笔记用），返回是否新建。
+    ///
+    /// 和 ensureNote 的区别很关键：ensureNote 会写一行 `# 标题`，
+    /// 编辑器载入后光标停在那行标题里，用户一开口打字就接在标题后面，
+    /// 标题被写成「笔记-20260919-101722今天开会讨论…」。空文件则是干净的一段。
+    @discardableResult
+    func touchNote(_ id: String) -> Bool {
+        let url = url(for: id)
+        if FileManager.default.fileExists(atPath: url.path) { return false }
+        return writeNow(id, "")
+    }
+
     /// 追加内容到笔记末尾。用于「静默存入今日笔记」与归档。
     /// 以「未落盘的输入（如果有）优先，否则磁盘内容」为基础，避免丢字。
     @discardableResult

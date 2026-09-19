@@ -97,6 +97,10 @@ function App() {
   const emitChange = useCallback(async () => {
     try {
       const md = await editor.blocksToMarkdownLossy(editor.document);
+      // 诊断用：真实打字到底有没有触发 onChange。
+      // 「字进不去编辑器」和「进了但回调没触发」是两种完全不同的故障，
+      // 没有这个计数器就只能靠猜。
+      window.__fnChangeCount = (window.__fnChangeCount || 0) + 1;
       post({ type: "change", markdown: md });
     } catch (e) {
       log("Markdown 导出失败: " + e);

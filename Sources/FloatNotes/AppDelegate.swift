@@ -198,6 +198,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        // --type-probe <报告文件>：用**真实键盘事件**打字，验证「打字 → 保存」。
+        // 这个是必要的：--new-note-probe 走的是 exportNow()，程序化触发 emitChange，
+        // 而真实打字靠的是 BlockNoteView 的 onChange 回调。两者不是一条路 ——
+        // 用户报的正是「新建后打字，文件根本不出现」。
+        if let i = CommandLine.arguments.firstIndex(of: "--type-probe") {
+            let out = (i + 1 < CommandLine.arguments.count)
+                ? CommandLine.arguments[i + 1] : "/tmp/floatnotes-type.txt"
+            runTypeProbe(to: out)
+            return
+        }
+
         // --note-probe：诊断「滚动」与「图片进 md」两个问题
         if CommandLine.arguments.contains("--note-probe") {
             runNoteProbe()
@@ -1288,6 +1299,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         NoteWindowManager.shared.close(id)
                         NoteStore.shared.delete(id)
                         lines.append("⑤ 已清理探针笔记")
+                        finish()
+                    }
+                }
+            }
+        }
+    }
+
+    private func runTypeProbe(to out: String) {
+        var lines: [String] = []
+        var done = false
+        let previousApp = NSWorkspace.shared.frontmostApplication
+
+        func finish() {
+            guard !done else { return }
+            done = true
+            // 用完把前台还给原来的 App，别把用户的焦点抢走不放
+            previousApp?.activate()
+            try? lines.joined(separator: "\n")
+                .write(to: URL(fileURLWithPath: out), atomically: true, encoding: .utf8)
+            for l in lines { Self.log("[type-probe] \(l)") }
+            exit(0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+            lines.append("★ 超时：30 秒没走完")
+            finish()
+        }
+
+        let openBefore = Set(NoteWindowManager.shared.openIDs)
+        NoteWindowManager.shared.newNote()
+        guard let id = NoteWindowManager.shared.openIDs.first(where: { !openBefore.contains($0) }) else {
+            lines.append("★ newNote() 没产生窗口"); finish(); return
+        }
+        let url = NoteStore.shared.url(for: id)
+        lines.append("新笔记 id = \(id)")
+        lines.append("目标路径 = \(url.path)")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            guard let panel = NoteWindowManager.shared.panel(for: id),
+                  let ed = NoteWindowManager.shared.editor(for: id) else {
+                lines.append("★ 拿不到窗口/编辑器"); finish(); return
+            }
+
+            // 键盘事件是按「焦点」投递的，不像滚轮按指针位置，
+            // 所以必须先把本 App 激活，否则这些字会打进用户当前那个 App 里。
+            // ★ 注意 Info.plist 里 LSUIElement=true，默认是 .accessory 策略，
+            //   那种状态下 activate 是无效的 —— 必须先切到 .regular，
+            //   否则按键会打到别的 App，测出来「字没进编辑器」是假象。
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+            panel.makeFirstResponder(ed.webView)
+            ed.focusEditor()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
+                lines.append("激活状态：本 App isActive=\(NSApp.isActive) 前台 App=\(front)")
+                if !NSApp.isActive {
+                    lines.append("★ 没能拿到前台，按键会打到别处，这次结果不算数")
+                }
+                let src = CGEventSource(stateID: .combinedSessionState)
+                let text = "打字保存测试ABC"
+                for ch in Array(text.utf16) {
+                    var u = ch
+                    if let d = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) {
+                        d.keyboardSetUnicodeString(stringLength: 1, unicodeString: &u)
+                        d.post(tap: .cghidEventTap)
+                    }
+                    if let u2 = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+                        var c2 = ch
+                        u2.keyboardSetUnicodeString(stringLength: 1, unicodeString: &c2)
+                        u2.post(tap: .cghidEventTap)
+                    }
+                    usleep(60_000)
+                }
+                lines.append("已投递 \(text.count) 个真实按键")
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    // 先看字进没进编辑器 —— 没进去说明问题在输入，不在保存
+                    ed.evaluate("""
+                    JSON.stringify({
+                      text: document.querySelector('.bn-editor')?.innerText ?? '',
+                      changes: window.__fnChangeCount || 0
+                    })
+                    """) { inner in
+                        var shown = ""
+                        var changes = -1
+                        if let s = inner as? String, let d = s.data(using: .utf8),
+                           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                            shown = ((o["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                            changes = (o["changes"] as? NSNumber)?.intValue ?? -1
+                        }
+                        lines.append("编辑器里的内容 = 「\(shown)」")
+                        lines.append("onChange 触发次数 = \(changes)")
+                        if shown.isEmpty {
+                            lines.append("★ 字根本没进编辑器 → 问题在输入链路，不是保存")
+                        } else if changes <= 0 {
+                            lines.append("★ 字进去了但 onChange 没触发 → BlockNoteView 回调没接上")
+                        }
+
+                        let exists = FileManager.default.fileExists(atPath: url.path)
+                        lines.append("文件存在 = \(exists)")
+                        if exists {
+                            let onDisk = NoteStore.shared.load(id)
+                            lines.append("磁盘内容 = 「\(onDisk.trimmingCharacters(in: .whitespacesAndNewlines))」")
+                            lines.append("打字内容进了磁盘 = \(onDisk.contains("打字保存测试"))")
+                        } else {
+                            lines.append("★ 打字之后文件仍不存在 → 真实打字的 onChange 没有触发保存")
+                            lines.append("   待写队列 = \(NoteStore.shared.pendingWriteCount)")
+                        }
+
+                        NoteStore.shared.flush()
+                        NoteWindowManager.shared.close(id)
+                        NoteStore.shared.delete(id)
+                        lines.append("已清理")
                         finish()
                     }
                 }
@@ -3276,13 +3401,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func stage21Wheel(panel: NotePanel, ed: WebEditorView) {
         guard !finished else { return }
 
-        let savedFrame = panel.frame
-        let mouse = NSEvent.mouseLocation
+        // 把**光标**挪到窗口正中，而不是把窗口挪到光标底下。
+        // 后者在光标贴近屏幕边缘时会被 constrainFrameRect 夹回来，
+        // 窗口就不在光标下面了，滚轮事件自然打不到 —— 表现为偶发「滚不动」假失败。
+        let savedCursor = CGEvent(source: nil)?.location
+        let cgRect = ScreenCapture.screenPointRect(fromCocoa: panel.frame)
+        CGWarpMouseCursorPosition(CGPoint(x: cgRect.midX, y: cgRect.midY))
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            // 把窗口挪到鼠标底下 —— 这样不用移动用户的光标也能收到滚轮事件
-            panel.setFrameOrigin(NSPoint(x: mouse.x - panel.frame.width / 2,
-                                         y: mouse.y - panel.frame.height / 2))
             panel.makeKey()
             panel.makeFirstResponder(ed.webView)
             ed.focusEditor()
@@ -3320,10 +3446,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                     self.problems.append("有 \(Int(maxScroll))px 可滚内容，真实滚轮却没送达（这正是不该漏掉的回归）")
                                 }
                             }
-                            // 还原窗口位置
-                            panel.setFrame(savedFrame, display: true)
+                            // 光标还回去，别把用户的鼠标留在我们窗口里
+                            if let c = savedCursor { CGWarpMouseCursorPosition(c) }
                             self.stage21Image(panel: panel, ed: ed)
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// D. 真实打字能不能落盘
+    ///
+    /// 用户报的就是这条：新建笔记、打字，文件在 Finder 里根本不出现。
+    /// 自检原来只验了 exportNow()（程序化触发 emitChange），那和真实打字**不是一条路** ——
+    /// 真实打字走 BlockNoteView 的 onChange 回调，所以这个缺口一直没被发现。
+    private func stage22() {
+        guard !finished else { return }
+        Self.log("[selftest] 阶段22 · 真实打字落盘")
+
+        let openBefore = Set(NoteWindowManager.shared.openIDs)
+        NoteWindowManager.shared.newNote()
+        guard let id = NoteWindowManager.shared.openIDs.first(where: { !openBefore.contains($0) }) else {
+            problems.append("newNote() 没开出新窗口")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+        let url = NoteStore.shared.url(for: id)
+        let created = FileManager.default.fileExists(atPath: url.path)
+        Self.log("[selftest] 新建即产生文件 = \(created)（否则 Finder 里看不出新建过）")
+        if !created { problems.append("新建笔记后磁盘上没有文件") }
+
+        guard let panel = NoteWindowManager.shared.panel(for: id),
+              let ed = NoteWindowManager.shared.editor(for: id) else {
+            problems.append("拿不到新笔记的窗口/编辑器")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+
+        let previousApp = NSWorkspace.shared.frontmostApplication
+        // Info.plist 里 LSUIElement=true，默认 .accessory 策略下 activate 无效，
+        // 必须先切 .regular，否则按键会打进别的 App
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(ed.webView)
+        ed.focusEditor()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self else { return }
+
+            // ★ 这里**不用**全局键盘事件。
+            //   试过用 CGEvent 真打字，结果整个自检变成看天吃饭：
+            //   有没有拿到前台、光标在哪、别的 App 有没有抢焦点，都会左右结果，
+            //   而且一旦没拿到焦点，那些字会直接打进用户当前那个 App 里。
+            //   execCommand('insertText') 走的是和真人打字同一条 DOM 路径
+            //   （beforeinput → ProseMirror 事务 → BlockNoteView onChange），
+            //   少了「系统投递按键」这一段，但那一段已经由 --type-probe 单独验过了。
+            ed.evaluate("""
+            (() => {
+              const el = document.querySelector('.bn-editor');
+              if (!el) return 'no-editor';
+              el.focus();
+              const ok = document.execCommand('insertText', false, '打字落盘检查XYZ');
+              return ok ? 'ok' : 'execCommand-failed';
+            })()
+            """) { r in
+                let res = (r as? String) ?? "?"
+                Self.log("[selftest] 注入打字结果 = \(res)")
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    ed.evaluate("window.__fnChangeCount || 0") { n in
+                        let changes = (n as? NSNumber)?.intValue ?? -1
+                        let onDisk = NoteStore.shared.load(id)
+                        Self.log("[selftest] 打字后 onChange 触发 \(changes) 次，磁盘内容 "
+                               + "= 「\(onDisk.trimmingCharacters(in: .whitespacesAndNewlines))」")
+                        if changes <= 0 {
+                            self.problems.append("打字没有触发 onChange（编辑器回调断了）")
+                        }
+                        if !onDisk.contains("打字落盘检查") {
+                            self.problems.append("打字内容没有落盘（用户报的就是这个）")
+                        }
+
+                        previousApp?.activate()
+                        NoteWindowManager.shared.close(id)
+                        NoteStore.shared.delete(id)
+                        self.finish(ok: self.problems.isEmpty,
+                                    reason: self.problems.joined(separator: "; "))
                     }
                 }
             }
@@ -3370,8 +3577,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 }
                                 NoteStore.shared.delete(id)
 
-                                self.finish(ok: self.problems.isEmpty,
-                                            reason: self.problems.joined(separator: "; "))
+                                self.stage22()
                             }
                         }
                     }

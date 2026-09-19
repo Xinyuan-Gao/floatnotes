@@ -106,7 +106,8 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
         let id = NoteStore.shared.newNoteID()
         // 立刻建出文件。之前要等第一次内容变化才落盘，于是「新建了笔记但还没打字」
         // 在 Finder 里没有任何痕迹，看着就像新建失败；会话恢复也找不到它。
-        NoteStore.shared.ensureNote(id)
+        // 用 touchNote 建空文件，不能用 ensureNote —— 那会写一行标题把光标困在 H1 里。
+        NoteStore.shared.touchNote(id)
         open(id)
     }
 
