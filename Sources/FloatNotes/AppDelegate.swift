@@ -129,9 +129,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exit(trusted ? 0 : 1)
         }
 
+        // --save-probe <报告文件>：验证「笔记到底能不能写进 ~/Documents」。
+        // ★ 这个探针必须用 `open -n --args` 启动，不能直接从终端跑：
+        //   从终端跑会继承终端的磁盘授权，测出来一切正常，而用户双击打开的 App
+        //   是另一个身份。屏幕录制那次就是被这个坑骗过一回，磁盘权限同理。
+        if let i = CommandLine.arguments.firstIndex(of: "--save-probe") {
+            let out = (i + 1 < CommandLine.arguments.count)
+                ? CommandLine.arguments[i + 1] : "/tmp/floatnotes-save.txt"
+            let fm = FileManager.default
+            var report = "时间: \(Date())\n"
+            report += "父进程 PID: \(getppid())\n"
+            report += "bundle: \(Bundle.main.bundlePath)\n"
+            let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
+            report += "Documents: \(docs.path)（可写=\(fm.isWritableFile(atPath: docs.path))）\n"
+            let root = NoteStore.shared.root
+            report += "笔记根目录: \(root.path)\n"
+            report += "  存在=\(fm.fileExists(atPath: root.path)) 可写=\(fm.isWritableFile(atPath: root.path))\n"
+            if let attrs = try? fm.attributesOfItem(atPath: root.path) {
+                report += "  权限=\((attrs[.posixPermissions] as? NSNumber)?.stringValue ?? "?") "
+                report += "属主=\(attrs[.ownerAccountName] as? String ?? "?")\n"
+            }
+            if let listing = try? fm.contentsOfDirectory(atPath: root.path) {
+                report += "  目录内容(\(listing.count)): \(listing.prefix(8).joined(separator: ", "))\n"
+            } else {
+                report += "  目录内容: ★列不出来（很可能没有磁盘授权）\n"
+            }
+
+            // 1. 裸写一个文件 —— 绕开 NoteStore 的错误吞噬，看到真正的 error
+            let probeID = "保存探针"
+            let dest = NoteStore.shared.url(for: probeID)
+            let tmp = dest.deletingLastPathComponent().appendingPathComponent(".probe.tmp")
+            do {
+                try "probe".write(to: tmp, atomically: false, encoding: .utf8)
+                _ = try fm.replaceItemAt(dest, withItemAt: tmp)
+                report += "裸写测试: 成功\n"
+            } catch {
+                report += "裸写测试: ★失败 → \(error)\n"
+            }
+
+            // 2. 走真正的保存链路
+            let n = UUID().uuidString.prefix(6)
+            let id = "保存探针\(n)"
+            let ok = NoteStore.shared.appendText("探针内容 \(n)", to: id)
+            let back = NoteStore.shared.load(id)
+            report += "NoteStore 保存返回: \(ok)\n"
+            report += "从磁盘读回: 「\(back.trimmingCharacters(in: .whitespacesAndNewlines))」\n"
+            report += "文件真的在盘上: \(fm.fileExists(atPath: NoteStore.shared.url(for: id).path))\n"
+            NoteStore.shared.delete(id)
+            try? fm.removeItem(at: dest)
+
+            try? report.write(to: URL(fileURLWithPath: out), atomically: true, encoding: .utf8)
+            exit(0)
+        }
+
         // --paste-probe：走完整的「粘贴图片 → 自动保存 → 读 md」链路
         if CommandLine.arguments.contains("--paste-probe") {
             runPasteProbe()
+            return
+        }
+
+        // --new-note-probe <报告文件>：完整走一遍「新建笔记 → 编辑器就绪 →
+        // 内容变化 → 落盘 → 读回」，回答「新建的笔记到底有没有写进磁盘」。
+        // 注意 open() 是不建文件的，要等 onChange 才会写 —— 所以要验的是整条链路。
+        if let i = CommandLine.arguments.firstIndex(of: "--new-note-probe") {
+            let out = (i + 1 < CommandLine.arguments.count)
+                ? CommandLine.arguments[i + 1] : "/tmp/floatnotes-newnote.txt"
+            runNewNoteProbe(to: out)
             return
         }
 
@@ -171,6 +234,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recoverInterruptedSelftest()
 
         NoteWindowManager.shared.onLog = { msg in Self.log(msg) }
+
+        // 落盘失败一定要让用户看见。之前只写 NSLog，界面毫无反应，
+        // 用户只会觉得「我打了半天字，文件却没保存」，也无从判断是权限还是路径问题。
+        NoteStore.shared.onWriteError = { msg in
+            Self.log("[store] ✗ \(msg)")
+            let brief = msg.count > 46 ? String(msg.prefix(46)) + "…" : msg
+            CaptureToast.shared.show(brief, accent: .systemRed)
+        }
+        if let pending = NoteStore.pendingWriteError {
+            NoteStore.pendingWriteError = nil
+            NoteStore.shared.onWriteError?(pending)
+        }
 
         setupStatusItem()
         setupFloatingBall()
@@ -1143,6 +1218,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - 粘贴 → 存盘 探针
 
+    private func runNewNoteProbe(to out: String) {
+        var lines: [String] = []
+        let fm = FileManager.default
+        var done = false
+
+        func finish() {
+            guard !done else { return }
+            done = true
+            try? lines.joined(separator: "\n")
+                .write(to: URL(fileURLWithPath: out), atomically: true, encoding: .utf8)
+            for l in lines { Self.log("[new-note-probe] \(l)") }
+            exit(0)
+        }
+        // 探针必须有兜底，卡住就永远拿不到报告
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+            lines.append("★ 超时：25 秒内没走完链路")
+            finish()
+        }
+
+        let before = NoteStore.shared.recent(limit: 200)
+        lines.append("新建前磁盘上共 \(before.count) 篇笔记")
+        let openBefore = Set(NoteWindowManager.shared.openIDs)
+
+        // 走真实的 ⌥⌘N 路径（不是自己拼 open(id)），否则测不到 newNote() 里的建文件逻辑
+        NoteWindowManager.shared.newNote()
+        let fresh = NoteWindowManager.shared.openIDs.filter { !openBefore.contains($0) }
+        guard let id = fresh.first else {
+            lines.append("★ newNote() 之后没多出窗口")
+            finish(); return
+        }
+        lines.append("新笔记 id = \(id)")
+
+        let url = NoteStore.shared.url(for: id)
+        lines.append("目标路径 = \(url.path)")
+        lines.append("① 刚新建完文件就存在 = \(fm.fileExists(atPath: url.path))（应为 true：新建即建文件）")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            guard let ed = NoteWindowManager.shared.editor(for: id) else {
+                lines.append("★ 拿不到编辑器，链路断在这里")
+                finish(); return
+            }
+            lines.append("② 编辑器已就绪")
+
+            let body = "# 保存链路测试\n\n这是一段用来验证保存的文字。\n\n![x](floatnotes://media/fake.png)\n"
+            ed.load(markdown: body)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                // exportNow 就是 BlockNoteView onChange 走的那条路
+                ed.evaluate("window.FloatNotes.exportNow()") { _ in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        let exists = fm.fileExists(atPath: url.path)
+                        lines.append("③ 触发内容变化后文件存在 = \(exists)")
+                        // 写失败的内容必须还留在待写队列里，否则用户刚打的字就永久没了
+                        lines.append("   待写队列剩余 = \(NoteStore.shared.pendingWriteCount)（成功时应为 0）")
+                        lines.append("   用户看到的提示 = 「\(NoteStore.pendingWriteError ?? "（无）")」")
+                        if exists {
+                            let onDisk = NoteStore.shared.load(id)
+                            lines.append("   磁盘内容 = 「\(onDisk.trimmingCharacters(in: .whitespacesAndNewlines))」")
+                            lines.append("   图片已转相对路径 = \(onDisk.contains("attachments/"))")
+                            lines.append("   残留自定义 scheme = \(onDisk.contains("floatnotes://media/"))")
+                        } else {
+                            lines.append("★ 没写进去 —— 保存链路有问题")
+                            lines.append("   目录内容 = \((try? fm.contentsOfDirectory(atPath: NoteStore.shared.root.path))?.joined(separator: ", ") ?? "列不出")")
+                        }
+                        lines.append("④ recent() 能列到它 = \(NoteStore.shared.recent(limit: 200).contains(id))")
+
+                        NoteStore.shared.flush()
+                        NoteWindowManager.shared.close(id)
+                        NoteStore.shared.delete(id)
+                        lines.append("⑤ 已清理探针笔记")
+                        finish()
+                    }
+                }
+            }
+        }
+    }
+
     private func runPasteProbe() {
         let id = "探针粘贴"
         NoteStore.shared.delete(id)
@@ -1636,6 +1788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         backupSettings()
+        backupUserNotes()
         PasteboardSnapshot.logger = { Self.log("[pboard] \($0)") }
         baselineMB = Perf.residentMemoryMB()
         Self.log(String(format: "[selftest] 基线内存 %.1f MB", baselineMB))
@@ -2200,14 +2353,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// 自检造出来的笔记全部清掉
+    ///
+    /// ★ 注意这里**不能**把 DailyNote.todayID() 直接删掉。
+    ///   今日笔记是真·用户数据，不是测试产物。之前的版本把它和测试笔记一起删，
+    ///   于是每跑一次自检，用户当天的摘录就被清空一次 —— 这正是「笔记凭空消失」的元凶。
+    ///   现在改成自检开始前备份、结束后还原，见 backupUserNotes() / restoreUserNotes()。
     private func cleanupAllTestNotes() {
-        let ids = [DailyNote.todayID(), "自检主题笔记",
-                   Self.selftestID, "外部同步测试"]
+        let ids = ["自检主题笔记", Self.selftestID, "外部同步测试"]
         for id in ids {
             NoteWindowManager.shared.close(id)
             NoteStore.shared.delete(id)
             try? FileManager.default.removeItem(at: NoteStore.shared.url(for: id))
         }
+    }
+
+    // MARK: - 今日笔记的备份 / 还原
+
+    private var dailyNoteBackup: String?
+    private var dailyNoteExisted = false
+
+    /// 自检会往今日笔记里灌测试内容，跑之前先原样存下来
+    private func backupUserNotes() {
+        let id = DailyNote.todayID()
+        let url = NoteStore.shared.url(for: id)
+        dailyNoteExisted = FileManager.default.fileExists(atPath: url.path)
+        dailyNoteBackup = dailyNoteExisted ? NoteStore.shared.load(id) : nil
+        if dailyNoteExisted {
+            Self.log("[selftest] 今日笔记已备份（\(dailyNoteBackup?.count ?? 0) 字），跑完原样还回去")
+        }
+    }
+
+    /// 把今日笔记恢复成自检之前的样子。
+    /// 原来没有这个文件就删掉测试留下的那份，原来有就连内容一起还原。
+    private func restoreUserNotes() {
+        let id = DailyNote.todayID()
+        NoteWindowManager.shared.close(id)
+        if dailyNoteExisted, let saved = dailyNoteBackup {
+            NoteStore.shared.replaceAll(id, with: saved)
+            Self.log("[selftest] 今日笔记已还原（\(saved.count) 字）")
+        } else {
+            NoteStore.shared.delete(id)
+            try? FileManager.default.removeItem(at: NoteStore.shared.url(for: id))
+        }
+        dailyNoteBackup = nil
     }
 
     // MARK: M4 检查
@@ -3198,6 +3386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // 无论走哪条路（成功 / 断言失败 / 超时）都要把用户设置还原、把测试笔记删掉
         restoreSettings()
+        restoreUserNotes()
         cleanupAllTestNotes()
 
         // ★ 关键：UserDefaults 的写入是异步的，而下面用的是 exit()，

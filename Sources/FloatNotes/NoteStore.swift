@@ -12,6 +12,10 @@ final class NoteStore {
     private var flushTimer: Timer?
     private let debounce: TimeInterval = 0.4
 
+    /// 落盘失败时回调（App 层接上提示条）。界面还没准备好就先攒着。
+    var onWriteError: ((String) -> Void)?
+    static var pendingWriteError: String?
+
     private init() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         root = docs.appendingPathComponent("悬浮笔记", isDirectory: true)
@@ -247,9 +251,16 @@ final class NoteStore {
     }
 
     func flush() {
-        for (id, text) in dirty { writeNow(id, text) }
-        dirty.removeAll()
+        // ★ 写失败的内容必须留在 dirty 里。
+        //   之前是无条件 removeAll()：只要写失败一次，用户刚打的字就
+        //   彻底没了 —— 界面上没提示，重试也不会再写第二次。
+        for (id, text) in dirty where writeNow(id, text) {
+            dirty.removeValue(forKey: id)
+        }
     }
+
+    /// 还有多少篇没成功落盘（自检 / 诊断用）
+    var pendingWriteCount: Int { dirty.count }
 
     /// 唯一的原子写入口（临时文件 + replaceItemAt），其它写入方法都走这里
     @discardableResult
@@ -266,7 +277,34 @@ final class NoteStore {
         } catch {
             try? FileManager.default.removeItem(at: tmp)
             NSLog("[NoteStore] 写入失败 \(id): \(error)")
+            reportWriteFailure(id: id, error: error)
             return false
+        }
+    }
+
+    /// 落盘失败时必须让人看见。
+    ///
+    /// 之前只写 NSLog：用户那边表现为「打了一堆字，文件却没出现」，
+    /// 而且完全没有任何提示，只能怀疑是自己没保存 —— 排查时根本无从下手。
+    /// 现在把原因回抛给界面，同时也把失败的那篇内容留在内存里，
+    /// 万一只是暂时写不进去（比如权限弹窗还没点），下次 flush 还能补上。
+    private func reportWriteFailure(id: String, error: Error) {
+        let ns = error as NSError
+        var hint = "「\(id)」保存失败"
+        switch ns.code {
+        case NSFileWriteNoPermissionError:
+            hint += "：没有写入权限，请检查「系统设置 › 隐私与安全性 › 文件与文件夹」"
+        case NSFileWriteOutOfSpaceError:
+            hint += "：磁盘空间不足"
+        case NSFileNoSuchFileError:
+            hint += "：笔记目录不存在或已被移走"
+        default:
+            hint += "：\(ns.localizedDescription)"
+        }
+        if let cb = onWriteError {
+            cb(hint)
+        } else {
+            Self.pendingWriteError = hint
         }
     }
 

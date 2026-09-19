@@ -103,7 +103,11 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
     }
 
     func newNote() {
-        open(NoteStore.shared.newNoteID())
+        let id = NoteStore.shared.newNoteID()
+        // 立刻建出文件。之前要等第一次内容变化才落盘，于是「新建了笔记但还没打字」
+        // 在 Finder 里没有任何痕迹，看着就像新建失败；会话恢复也找不到它。
+        NoteStore.shared.ensureNote(id)
+        open(id)
     }
 
     /// 启动时恢复上次会话
