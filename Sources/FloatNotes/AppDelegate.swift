@@ -323,6 +323,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        // --launch-note-probe <报告文件>：★ 这个探针**不提前 return**。
+        // 要复现的正是「App 启动时自带的那个窗口」，所以必须让完整启动流程
+        // （setupStatusItem / restoreSession / 会话恢复）真的跑完，
+        // 再对那个窗口做打字落盘检查。提前 return 就不是那个场景了。
+        var launchProbeOut: String?
+        if let i = CommandLine.arguments.firstIndex(of: "--launch-note-probe") {
+            launchProbeOut = (i + 1 < CommandLine.arguments.count)
+                ? CommandLine.arguments[i + 1] : "/tmp/floatnotes-launch.txt"
+        }
+
+        // --cycle-probe <write|read> <报告文件>：两步实验，验「启动窗口写进去的东西
+        // 下次启动还在不在」。用户报的就是「刚打开就有的那个窗口存不住」，
+        // 而这必须跨一次真实的启动 / 退出才能看出来。
+        var cycleProbe: (mode: String, out: String)?
+        if let i = CommandLine.arguments.firstIndex(of: "--cycle-probe"),
+           i + 2 < CommandLine.arguments.count {
+            cycleProbe = (CommandLine.arguments[i + 1], CommandLine.arguments[i + 2])
+        }
+
         if isSelfTest {
             NoteWindowManager.shared.open(Self.selftestID, focus: false)
             runSelfTest()
@@ -331,6 +350,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !Settings.shared.hasOnboarded {
                 Settings.shared.hasOnboarded = true
                 showOnboarding()
+            }
+            // 放在完整启动流程之后：这里才等价于「用户刚打开 App 看到的样子」
+            if let out = launchProbeOut { runLaunchNoteProbe(to: out) }
+            if let c = cycleProbe { runCycleProbe(mode: c.mode, to: c.out) }
+        }
+    }
+
+    /// 跨一次启动/退出，验「启动自带窗口」里的内容能不能活下来。
+    private func runCycleProbe(mode: String, to out: String) {
+        var lines: [String] = []
+        var done = false
+
+        func finish() {
+            guard !done else { return }
+            done = true
+            try? lines.joined(separator: "\n")
+                .write(to: URL(fileURLWithPath: out), atomically: true, encoding: .utf8)
+            for l in lines { Self.log("[cycle] \(l)") }
+            exit(0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+            lines.append("★ 超时"); finish()
+        }
+
+        let ids = NoteWindowManager.shared.openIDs
+        lines.append("模式 = \(mode)")
+        lines.append("session.openNotes = \(NoteStore.shared.openNoteIDs)")
+        lines.append("启动后打开的窗口 = \(ids)")
+        guard let id = ids.first, let ed = NoteWindowManager.shared.editor(for: id) else {
+            lines.append("★ 没有窗口或拿不到编辑器"); finish(); return
+        }
+        let url = NoteStore.shared.url(for: id)
+        lines.append("启动窗口 id = 「\(id)」")
+        lines.append("磁盘文件存在 = \(FileManager.default.fileExists(atPath: url.path))")
+        lines.append("磁盘内容 = 「\(NoteStore.shared.load(id).trimmingCharacters(in: .whitespacesAndNewlines))」")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            if mode == "write" {
+                ed.evaluate("""
+                (() => { const el=document.querySelector('.bn-editor'); if(!el) return 'no-editor';
+                  el.focus();
+                  return document.execCommand('insertText', false, 'CYCLE写入标记ZZZ') ? 'ok':'failed'; })()
+                """) { r in
+                    lines.append("注入打字 = \(r)")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        lines.append("注入后磁盘内容 = 「\(NoteStore.shared.load(id))」")
+                        // 走真实退出路径
+                        NoteStore.shared.flush()
+                        NoteStore.shared.rememberOpenNotes(NoteWindowManager.shared.openIDs)
+                        lines.append("已按退出路径 flush + 记录会话 → \(NoteStore.shared.openNoteIDs)")
+                        finish()
+                    }
+                }
+            } else {
+                ed.evaluate("document.querySelector('.bn-editor')?.innerText ?? ''") { t in
+                    let shown = ((t as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    lines.append("重启后编辑器显示 = 「\(shown)」")
+                    lines.append("磁盘里有标记 = \(NoteStore.shared.load(id).contains("CYCLE写入标记ZZZ"))")
+                    lines.append("界面里看得见标记 = \(shown.contains("CYCLE写入标记ZZZ"))")
+                    finish()
+                }
+            }
+        }
+    }
+
+    /// 对「启动自带的那个窗口」做打字落盘检查。
+    /// 用户报的正是这个窗口存不住，而新建的窗口可以。
+    private func runLaunchNoteProbe(to out: String) {
+        var lines: [String] = []
+        var done = false
+        let fm = FileManager.default
+
+        func finish() {
+            guard !done else { return }
+            done = true
+            try? lines.joined(separator: "\n")
+                .write(to: URL(fileURLWithPath: out), atomically: true, encoding: .utf8)
+            for l in lines { Self.log("[launch-probe] \(l)") }
+            exit(0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+            lines.append("★ 超时：30 秒没走完")
+            finish()
+        }
+
+        let ids = NoteWindowManager.shared.openIDs
+        lines.append("启动后打开的窗口 = \(ids)")
+        guard let id = ids.first else {
+            lines.append("★ 启动后一个窗口都没有")
+            finish(); return
+        }
+        let url = NoteStore.shared.url(for: id)
+        lines.append("启动窗口 id = 「\(id)」")
+        lines.append("① 它的文件此刻在磁盘上 = \(fm.fileExists(atPath: url.path))")
+
+        guard let ed = NoteWindowManager.shared.editor(for: id) else {
+            lines.append("★ 拿不到该窗口的编辑器")
+            finish(); return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            ed.evaluate("""
+            (() => {
+              const el = document.querySelector('.bn-editor');
+              if (!el) return 'no-editor';
+              el.focus();
+              return document.execCommand('insertText', false, '启动窗口保存检查QWE') ? 'ok' : 'failed';
+            })()
+            """) { r in
+                lines.append("② 注入打字 = \(r)")
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    ed.evaluate("window.__fnChangeCount || 0") { n in
+                        let changes = (n as? NSNumber)?.intValue ?? -1
+                        let exists = fm.fileExists(atPath: url.path)
+                        let onDisk = NoteStore.shared.load(id)
+                        lines.append("③ onChange 触发次数 = \(changes)")
+                        lines.append("④ 打字后文件存在 = \(exists)")
+                        lines.append("⑤ 磁盘内容 = 「\(onDisk.trimmingCharacters(in: .whitespacesAndNewlines))」")
+                        lines.append("⑥ 打字内容真的落盘 = \(onDisk.contains("启动窗口保存检查"))")
+                        lines.append("⑦ 待写队列 = \(NoteStore.shared.pendingWriteCount)")
+                        lines.append("⑧ 该笔记在 restorableNotes 里 = "
+                                   + "\(NoteStore.shared.restorableNotes().contains(id))")
+
+                        NoteStore.shared.flush()
+                        NoteStore.shared.delete(id)
+                        finish()
+                    }
+                }
             }
         }
     }
@@ -1915,6 +2063,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         backupSettings()
         backupUserNotes()
         PasteboardSnapshot.logger = { Self.log("[pboard] \($0)") }
+
+        // ★ 先把前台拿稳，再开始测。
+        //
+        // 阶段18（⌘C / ⌘V）和阶段19/21（真实滚轮、真实截图）用的都是**真实的系统事件**，
+        // 而系统事件只送给前台 App。以前自检从没保证过这一点，全靠环境凑巧 ——
+        // 结果就是这几个检查时灵时不灵：偶尔全过，偶尔一起报错。
+        // 这种假失败比没有测试更糟，因为真正的回归会被当成噪声忽略掉。
+        //
+        // 注意 Info.plist 里 LSUIElement=true，默认是 .accessory 策略，
+        // 那种状态下 activate 是无效的，必须先切到 .regular。
+        ensureFrontmost()
+
         baselineMB = Perf.residentMemoryMB()
         Self.log(String(format: "[selftest] 基线内存 %.1f MB", baselineMB))
 
@@ -1933,6 +2093,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in
             self?.finish(ok: false, reason: "自检总时长超过 90 秒")
         }
+    }
+
+    /// 确保本 App 拿到前台，并**等它真的生效**再回调。
+    ///
+    /// activate 是异步的：调用完立刻读 isActive 还是 false，
+    /// 于是后面依赖真实系统事件的检查照样会失败 —— 之前就是这么白改了一轮。
+    /// 所以这里轮询等，等不到也继续（但留一条明确的话，免得又被当成产品回归）。
+    private func ensureFrontmost(timeout: TimeInterval = 5.0, then: (() -> Void)? = nil) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        let deadline = Date().addingTimeInterval(timeout)
+        func poll() {
+            if NSApp.isActive {
+                Self.log("[selftest] 前台已就绪 isActive=true"
+                       + (then == nil ? "" : "，开始依赖真实系统事件的检查"))
+                then?()
+                return
+            }
+            if Date() > deadline {
+                Self.log("[selftest] ⚠️ 等了 \(Int(timeout)) 秒仍没拿到前台 isActive=false；"
+                       + "需要真实系统事件的检查（⌘C/⌘V、滚轮、截图）可能报假失败")
+                then?()
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: poll)
+        }
+        poll()
     }
 
     private func stage2() {
@@ -2912,19 +3099,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         pb.clearContents()
                         NSApp.sendAction(Selector(("copy:")), to: nil, from: nil)
 
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        // ★ 轮询而不是死等。
+                        //   WebKit 的复制是**异步**的：copy: 返回时剪贴板往往还是空的，
+                        //   内容要等 web 进程写完才出现。原来固定等 0.8 秒，
+                        //   机器一忙就偶尔读到空剪贴板 —— 表现为随机报「⌘C 没写进剪贴板」，
+                        //   实测大概五次里错一次。等够 3 秒、每 0.15 秒看一次就稳了。
+                        let deadline = Date().addingTimeInterval(3.0)
+                        func pollCopy() {
                             let copied = pb.string(forType: .string) ?? ""
-                            let copiedOK = copied.contains(token)
-                            Self.log("[selftest] 复制回环：剪贴板\(copiedOK ? "已拿到" : "没拿到")"
-                                   + "编辑器内容（\(copied.count) 字符）")
-                            if !copiedOK { self.problems.append("⌘C 复制没有写进剪贴板") }
+                            if copied.contains(token) || Date() > deadline {
+                                let copiedOK = copied.contains(token)
+                                Self.log("[selftest] 复制回环：剪贴板\(copiedOK ? "已拿到" : "没拿到")"
+                                       + "编辑器内容（\(copied.count) 字符）")
+                                if !copiedOK { self.problems.append("⌘C 复制没有写进剪贴板") }
 
-                            // 原样还回去（含图片、文件等非文本类型）
-                            PasteboardSnapshot.restore(savedClipboard)
-                            Self.log("[pboard] 已还原剪贴板 \(savedClipboard.count) 项")
+                                // 原样还回去（含图片、文件等非文本类型）
+                                PasteboardSnapshot.restore(savedClipboard)
+                                Self.log("[pboard] 已还原剪贴板 \(savedClipboard.count) 项")
 
-                            self.stage19()
+                                self.stage19()
+                                return
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: pollCopy)
                         }
+                        pollCopy()
                     }
                 }
             }
@@ -3196,6 +3394,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
             guard let self else { return }
+            // ⌘V 走的是「key window 的响应链」，所以粘不进编辑器时，
+            // 第一个要看的不是剪贴板而是**当前到底哪个窗口是 key**。
+            Self.log("[selftest] 粘贴前状态：isActive=\(NSApp.isActive) "
+                   + "keyWindow=「\(NSApp.keyWindow?.title ?? "无")」 "
+                   + "本窗口是 key=\(panel.isKeyWindow) 可见=\(panel.isVisible)")
             NSApp.sendAction(Selector(("paste:")), to: nil, from: nil)
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
@@ -3407,6 +3610,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let savedCursor = CGEvent(source: nil)?.location
         let cgRect = ScreenCapture.screenPointRect(fromCocoa: panel.frame)
         CGWarpMouseCursorPosition(CGPoint(x: cgRect.midX, y: cgRect.midY))
+        // 滚轮事件送给「光标底下那个窗口」，所以光标到底有没有落在窗口里必须打出来 ——
+        // 不然「滚不动」既可能是真回归，也可能只是光标没到位。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            let cur = CGEvent(source: nil)?.location ?? .zero
+            Self.log(String(format: "[selftest] 滚轮前：光标(%.0f,%.0f) 窗口(%.0f,%.0f %.0f×%.0f) 落在窗口内=%@ isActive=%@",
+                            cur.x, cur.y, cgRect.minX, cgRect.minY, cgRect.width, cgRect.height,
+                            cgRect.contains(cur) ? "是" : "否", NSApp.isActive ? "是" : "否"))
+        }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             panel.makeKey()
@@ -3464,6 +3675,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func stage22() {
         guard !finished else { return }
         Self.log("[selftest] 阶段22 · 真实打字落盘")
+
+        // A. 任何一条打开笔记的路径都必须留下文件。
+        //    用户报的「只有刚打开那个窗口存不住」，根子就是启动自带的窗口
+        //    走了一条不建文件的路，和新建窗口不一致。这里把 open() 本身钉住。
+        let probeID = "open自检\(Int(Date().timeIntervalSince1970) % 100000)"
+        NoteStore.shared.delete(probeID)
+        let probeURL = NoteStore.shared.url(for: probeID)
+        if FileManager.default.fileExists(atPath: probeURL.path) {
+            problems.append("测试前置失败：临时笔记已存在")
+        }
+        _ = NoteWindowManager.shared.open(probeID, focus: false)
+        let probeCreated = FileManager.default.fileExists(atPath: probeURL.path)
+        Self.log("[selftest] open() 之后文件已存在 = \(probeCreated)"
+               + "（启动自带的窗口走的就是这条路径）")
+        if !probeCreated { problems.append("open() 打开的笔记没有落盘文件（启动那个窗口就是这样存的）") }
+        NoteWindowManager.shared.close(probeID)
+        NoteStore.shared.delete(probeID)
 
         let openBefore = Set(NoteWindowManager.shared.openIDs)
         NoteWindowManager.shared.newNote()

@@ -56,6 +56,15 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
             return existing
         }
 
+        // ★ 每个打开的笔记都必须有对应的磁盘文件。
+        //
+        // 之前只有 ⌥⌘N 会建文件，而「启动时自带的那个窗口」走的是另一条路：
+        // 它没有文件、也进不了 restorableNotes，用户在里面打字后重启就没了，
+        // 而自己新建的窗口一切正常 —— 表现出来就是「只有刚打开那个窗口存不住」。
+        // 根子上是「有的窗口有文件、有的没有」这种不一致，这里一次性消灭掉：
+        // 只要窗口开出来，磁盘上就一定有对应的 .md。
+        NoteStore.shared.touchNote(id)
+
         let frame = NoteStore.shared.loadFrame(for: id) ?? defaultFrame()
         let panel = NotePanel(noteID: id, frame: frame, level: currentLevel)
         panel.delegate = self
@@ -103,12 +112,9 @@ final class NoteWindowManager: NSObject, NSWindowDelegate {
     }
 
     func newNote() {
-        let id = NoteStore.shared.newNoteID()
-        // 立刻建出文件。之前要等第一次内容变化才落盘，于是「新建了笔记但还没打字」
-        // 在 Finder 里没有任何痕迹，看着就像新建失败；会话恢复也找不到它。
-        // 用 touchNote 建空文件，不能用 ensureNote —— 那会写一行标题把光标困在 H1 里。
-        NoteStore.shared.touchNote(id)
-        open(id)
+        // 建文件这件事已经收进 open() 里统一做了 ——
+        // 之前只有这条路径建文件，启动自带的窗口不建，才出了「那个窗口存不住」的问题。
+        open(NoteStore.shared.newNoteID())
     }
 
     /// 启动时恢复上次会话
