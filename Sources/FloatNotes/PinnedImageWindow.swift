@@ -31,6 +31,27 @@ final class PinnedImagePanel: NSPanel {
         minSize = NSSize(width: 90, height: 60)
         animationBehavior = .utilityWindow
     }
+
+    /// 让窗口菜单里的「关闭 ⌘W」对固定图真的有效。
+    ///
+    /// NSWindow 默认的 performClose: 是去找关闭按钮；
+    /// 这个面板是 .borderless，根本没有关闭按钮，于是它只会「哔」一声什么都不做 ——
+    /// 表现为 ⌘W 按了没反应。这里直接接管，不绕那圈。
+    override func performClose(_ sender: Any?) {
+        close()
+    }
+
+    /// ⌘W 走的是 performKeyEquivalent 这条路（主菜单的快捷键），
+    /// 面板得能成为 key 才会被送到这里 —— canBecomeKey 已经是 true。
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if super.performKeyEquivalent(with: event) { return true }
+        // Esc 没在主菜单里，得自己认
+        if event.keyCode == 53 {
+            close()
+            return true
+        }
+        return false
+    }
 }
 
 /// 图片本体。按比例缩放填满窗口，外面留一点边当相框。
@@ -43,14 +64,91 @@ final class PinnedImageView: NSView {
     var onCloseAll: (() -> Void)?
 
     private let inset: CGFloat = 1
+    private var closeButton: NSButton?
 
     init(image: NSImage, frame: NSRect) {
         self.image = image
         super.init(frame: frame)
         wantsLayer = true
+        setupCloseButton()
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    /// 鼠标移到图上时，左上角冒出一个 ✕。
+    ///
+    /// 之前唯一的关闭入口是「右键 → 关闭」，快捷键也没接 ——
+    /// 用户根本不知道能关，只能右键翻菜单。
+    /// 用真正的子视图而不是自己画+自己命中测试：子视图会先拿到点击，
+    /// 所以点 ✕ 不会触发「按住背景拖窗口」，图片其他地方照旧可以按着拖。
+    private func setupCloseButton() {
+        let size: CGFloat = 18
+        let b = NSButton(frame: NSRect(x: 6, y: bounds.height - size - 6,
+                                       width: size, height: size))
+        b.title = "✕"
+        b.isBordered = false
+        b.bezelStyle = .circular
+        b.font = .systemFont(ofSize: 11, weight: .bold)
+        b.contentTintColor = .white
+        b.wantsLayer = true
+        b.layer?.backgroundColor = NSColor(calibratedWhite: 0, alpha: 0.55).cgColor
+        b.layer?.cornerRadius = size / 2
+        b.target = self
+        b.action = #selector(closeAction)
+        b.toolTip = "关闭（也可以按 Esc 或 ⌘W）"
+        b.isHidden = true
+        // 窗口拉高拉矮时，✕ 得一直贴着上边
+        b.autoresizingMask = [.minYMargin]
+        addSubview(b)
+        closeButton = b
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        // .activeAlways：App 不是前台时也要能感应悬停，
+        // 否则从别的 App 截完图，鼠标移上去什么都不会出现
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { setHovering(true) }
+    override func mouseExited(with event: NSEvent) { setHovering(false) }
+
+    private func setHovering(_ hovering: Bool) {
+        closeButton?.isHidden = !hovering
+    }
+
+    /// 自检用：✕ 按钮现在是否露着
+    var isCloseButtonVisible: Bool { closeButton?.isHidden == false }
+
+    /// 自检用：模拟鼠标移进 / 移出。
+    /// 直接调 mouseEntered 需要造一个 NSEvent，没必要 —— 这里只验「悬停 → ✕ 出现」这条线。
+    func simulateHover(_ hovering: Bool) { setHovering(hovering) }
+
+    /// 按键落在图上时：Esc 直接关掉。
+    /// 截完图窗口就是 key，用户下意识按 Esc 应该就能收掉它。
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {          // Esc
+            onClose?()
+            return
+        }
+        super.keyDown(with: event)        // 其余按键交回响应链，别吞掉
+    }
+
+    /// ⌘W / ⌘C / ⌘S 在窗口层面就拦下了（见 PinnedImagePanel.performKeyEquivalent），
+    /// 这里兜一道，保证视图直接当 firstResponder 时也有效。
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.command) else { return false }
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "w": onClose?(); return true
+        case "c": onCopy?(); return true
+        case "s": onSave?(); return true
+        default: return false
+        }
+    }
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -99,13 +197,13 @@ final class PinnedImageView: NSView {
         copyItem.target = self
         menu.addItem(copyItem)
 
-        let saveItem = NSMenuItem(title: "存储为 PNG…", action: #selector(saveAction), keyEquivalent: "")
+        let saveItem = NSMenuItem(title: "存储为 PNG…  ⌘S", action: #selector(saveAction), keyEquivalent: "")
         saveItem.target = self
         menu.addItem(saveItem)
 
         menu.addItem(.separator())
 
-        let closeItem = NSMenuItem(title: "关闭  ⌘W", action: #selector(closeAction), keyEquivalent: "")
+        let closeItem = NSMenuItem(title: "关闭  ⌘W / Esc", action: #selector(closeAction), keyEquivalent: "")
         closeItem.target = self
         menu.addItem(closeItem)
 

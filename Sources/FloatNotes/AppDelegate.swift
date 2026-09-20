@@ -3107,17 +3107,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         let deadline = Date().addingTimeInterval(3.0)
                         func pollCopy() {
                             let copied = pb.string(forType: .string) ?? ""
-                            if copied.contains(token) || Date() > deadline {
-                                let copiedOK = copied.contains(token)
-                                Self.log("[selftest] 复制回环：剪贴板\(copiedOK ? "已拿到" : "没拿到")"
-                                       + "编辑器内容（\(copied.count) 字符）")
-                                if !copiedOK { self.problems.append("⌘C 复制没有写进剪贴板") }
-
-                                // 原样还回去（含图片、文件等非文本类型）
+                            if copied.contains(token) {
+                                Self.log("[selftest] 复制回环：剪贴板已拿到编辑器内容（\(copied.count) 字符）")
                                 PasteboardSnapshot.restore(savedClipboard)
                                 Self.log("[pboard] 已还原剪贴板 \(savedClipboard.count) 项")
-
                                 self.stage19()
+                                return
+                            }
+                            if Date() > deadline {
+                                // 失败时要把「选区到底有没有选中」打出来：
+                                // 剪贴板空既可能是 copy: 没送达，也可能是 selectAll: 压根没选中
+                                editor.evaluate("""
+                                JSON.stringify({
+                                  sel: String(document.getSelection() || '').length,
+                                  active: document.activeElement ? document.activeElement.tagName : 'none',
+                                  text: (document.querySelector('.bn-editor')?.innerText || '').length
+                                })
+                                """) { info in
+                                    Self.log("[selftest] 复制回环：剪贴板没拿到编辑器内容（0 字符）"
+                                           + " 诊断=\(info as? String ?? "?")"
+                                           + " isActive=\(NSApp.isActive)"
+                                           + " key=\(NSApp.keyWindow?.title ?? "无")")
+                                    self.problems.append("⌘C 复制没有写进剪贴板")
+                                    PasteboardSnapshot.restore(savedClipboard)
+                                    Self.log("[pboard] 已还原剪贴板 \(savedClipboard.count) 项")
+                                    self.stage19()
+                                }
                                 return
                             }
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: pollCopy)
@@ -3362,6 +3377,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !hasImage { problems.append("截图没有正确写进剪贴板") }
         PasteboardSnapshot.restore(saved)
 
+        // E2. 快捷键关闭 —— 用户报「截完图只能右键删」，因为菜单里那个
+        //     「关闭 ⌘W」的 keyEquivalent 是空的，而 .borderless 面板
+        //     又没有关闭按钮，默认的 performClose: 只会「哔」一声。
+        //     这里把 Esc 和 ⌘W 两条路都真的按一遍。
+        stage19Shortcuts(nsImage: nsImage)
+    }
+
+    /// 验「截完图怎么收掉」：Esc 与 ⌘W 都必须真的能关
+    private func stage19Shortcuts(nsImage: NSImage) {
+        guard !finished else { return }
+
+        let before = PinnedImageManager.shared.count
+        guard let p = PinnedImageManager.shared.panel(at: before - 1),
+              let view = p.contentView else {
+            problems.append("拿不到固定图窗口，无法验证快捷键关闭")
+            stage19CloseRest(nsImage: nsImage); return
+        }
+
+        // Esc：走窗口的正常事件派发 → firstResponder 的 keyDown
+        p.makeKey()
+        p.makeFirstResponder(view)
+
+        // 悬停 ✕：不先验这个的话，以后谁把按钮去掉都不会有人发现 ——
+        // 用户又会回到「只能右键删」的状态
+        if let piv = view as? PinnedImageView {
+            piv.simulateHover(true)
+            let shown = piv.isCloseButtonVisible
+            piv.simulateHover(false)
+            let hidden = !piv.isCloseButtonVisible
+            Self.log("[selftest] 悬停时 ✕ 按钮：出现=\(shown) 移开后收起=\(hidden)")
+            if !shown { problems.append("鼠标移上去没有出现关闭按钮") }
+            if !hidden { problems.append("鼠标移开后关闭按钮没收起") }
+        } else {
+            problems.append("固定图内容视图类型不对，无法验证悬停按钮")
+        }
+
+        if let esc = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                      timestamp: ProcessInfo.processInfo.systemUptime,
+                                      windowNumber: p.windowNumber, context: nil,
+                                      characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+                                      isARepeat: false, keyCode: 53) {
+            p.sendEvent(esc)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            let afterEsc = PinnedImageManager.shared.count
+            let escWorked = afterEsc == before - 1
+            Self.log("[selftest] 按 Esc 关闭固定图：\(before) → \(afterEsc) 张 "
+                   + "\(escWorked ? "✅" : "✗")")
+            if !escWorked { self.problems.append("Esc 关不掉固定图（用户只能右键删就是这个原因）") }
+
+            // ⌘W：走窗口菜单那条 performKeyEquivalent 路
+            guard let q = PinnedImageManager.shared.panel(at: PinnedImageManager.shared.count - 1) else {
+                self.stage19CloseRest(nsImage: nsImage); return
+            }
+            let beforeW = PinnedImageManager.shared.count
+            q.makeKey()
+            if let w = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
+                                        timestamp: ProcessInfo.processInfo.systemUptime,
+                                        windowNumber: q.windowNumber, context: nil,
+                                        characters: "w", charactersIgnoringModifiers: "w",
+                                        isARepeat: false, keyCode: 13) {
+                _ = q.performKeyEquivalent(with: w)
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                let afterW = PinnedImageManager.shared.count
+                let wWorked = afterW == beforeW - 1
+                Self.log("[selftest] 按 ⌘W 关闭固定图：\(beforeW) → \(afterW) 张 "
+                       + "\(wWorked ? "✅" : "✗")")
+                if !wWorked { self.problems.append("⌘W 关不掉固定图") }
+                self.stage19CloseRest(nsImage: nsImage)
+            }
+        }
+    }
+
+    private func stage19CloseRest(nsImage: NSImage) {
         PinnedImageManager.shared.closeAll()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self else { return }
