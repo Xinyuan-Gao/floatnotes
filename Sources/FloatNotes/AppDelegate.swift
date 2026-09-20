@@ -182,6 +182,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exit(0)
         }
 
+        // --editor-probe <报告文件>：把编辑器的能力清单报出来（块类型、内联样式、
+        // 格式工具栏实际按钮、颜色设了之后 md 里还在不在）。
+        // 用户提的「不能选字体颜色」「不能选文本框格式」都得先看这份清单才能定方案。
+        if let i = CommandLine.arguments.firstIndex(of: "--editor-probe") {
+            let out = (i + 1 < CommandLine.arguments.count)
+                ? CommandLine.arguments[i + 1] : "/tmp/floatnotes-editor.json"
+            runEditorProbe(to: out)
+            return
+        }
+
         // --paste-probe：走完整的「粘贴图片 → 自动保存 → 读 md」链路
         if CommandLine.arguments.contains("--paste-probe") {
             runPasteProbe()
@@ -1564,6 +1574,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         finish()
                     }
                 }
+            }
+        }
+    }
+
+    private func runEditorProbe(to out: String) {
+        let id = "编辑器探针"
+        NoteStore.shared.delete(id)
+        NoteStore.shared.replaceAll(id, with: """
+        # 编辑器能力检查
+
+        这一段用来选中，看看格式工具栏上到底有哪些按钮。
+
+        - 列表项一
+        - 列表项二
+
+        ```json
+        {"a": 1}
+        ```
+        """)
+        NoteWindowManager.shared.open(id, focus: false)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            guard let ed = NoteWindowManager.shared.editor(for: id) else {
+                Self.log("[editor-probe] ✗ 拿不到编辑器"); exit(1)
+            }
+            ed.evaluate("window.FloatNotes._editorProbe(); 'started'") { _ in
+                // 探针内部有若干 await，结果通过全局变量回传，这里轮询取
+                let deadline = Date().addingTimeInterval(12)
+                var done = false
+                func poll() {
+                    guard !done else { return }
+                    ed.evaluate("window.__fnEditorProbe || 'null'") { r in
+                        let text = (r as? String) ?? "null"
+                        if text == "null", Date() < deadline {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: poll)
+                            return
+                        }
+                        done = true
+                        Self.log("[editor-probe] \(text)")
+                        try? text.write(to: URL(fileURLWithPath: out),
+                                        atomically: true, encoding: .utf8)
+                        NoteWindowManager.shared.close(id)
+                        NoteStore.shared.delete(id)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
+                    }
+                }
+                poll()
             }
         }
     }
@@ -3881,12 +3938,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         previousApp?.activate()
                         NoteWindowManager.shared.close(id)
                         NoteStore.shared.delete(id)
-                        self.finish(ok: self.problems.isEmpty,
-                                    reason: self.problems.joined(separator: "; "))
+                        self.stage23()
                     }
                 }
             }
         }
+    }
+
+    /// 阶段23 · 富文本格式（文字颜色 / 高亮 / 代码块语言）
+    ///
+    /// 用户报「选中文字改不了颜色」「没法选文本框格式」。
+    /// 这条特别容易「看着没问题其实没存住」：Markdown 本身表达不了颜色，
+    /// BlockNote 的导出也会把颜色悄悄丢掉（实测 mdKeepsColor=false）。
+    /// 所以要一路验到「md 里到底有没有颜色、读回来还认不认」，
+    /// 只验「编辑器里变了色」是不够的。
+    private func stage23() {
+        guard !finished else { return }
+        Self.log("[selftest] 阶段23 · 富文本格式（颜色 / 高亮 / 代码块语言）")
+
+        guard let ed = NoteWindowManager.shared.editor(for: Self.selftestID) else {
+            problems.append("拿不到编辑器，无法验证富文本格式")
+            finish(ok: false, reason: problems.joined(separator: "; ")); return
+        }
+        ed.load(markdown: "# 格式自检\n\n这一段用来验证文字颜色和代码块语言。\n\n```json\n{\"a\":1}\n```\n")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            ed.evaluate("window.FloatNotes._editorProbe(); 'started'") { _ in
+                let deadline = Date().addingTimeInterval(15)
+                var done = false
+                func poll() {
+                    guard !done else { return }
+                    ed.evaluate("window.__fnEditorProbe || 'null'") { r in
+                        let text = (r as? String) ?? "null"
+                        if text == "null", Date() < deadline {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: poll)
+                            return
+                        }
+                        done = true
+                        self.checkFormatProbe(text)
+                    }
+                }
+                poll()
+            }
+        }
+    }
+
+    private func checkFormatProbe(_ json: String) {
+        func bail(_ why: String) {
+            problems.append(why)
+            finish(ok: false, reason: problems.joined(separator: "; "))
+        }
+        guard let d = json.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
+            bail("格式自检拿不到结果：\(json.prefix(120))"); return
+        }
+
+        let mdHasColor = (o["mdHasColorHtml"] as? Bool) ?? false
+        let backColor = (o["reimportRestoredColor"] as? Bool) ?? false
+        let backHl = (o["reimportRestoredHighlight"] as? Bool) ?? false
+        let sample = (o["mdColorSample"] as? String) ?? ""
+        let fence = (o["codeFence"] as? String) ?? ""
+        let langSet = (o["codeLangSet"] as? Bool) ?? false
+        let toolbarShown = (o["ourToolbarShownOnDomSelection"] as? Bool) ?? false
+        let toolbarBtns = (o["ourToolbarButtons"] as? NSNumber)?.intValue ?? 0
+        let clickRed = (o["clickRedApplied"] as? Bool) ?? false
+
+        Self.log("[selftest] 工具栏：选中时出现=\(toolbarShown) 按钮数=\(toolbarBtns) 点红色块生效=\(clickRed)")
+        Self.log("[selftest] md 里的颜色写法 = \(sample)")
+        Self.log("[selftest] 颜色往返：md 有颜色=\(mdHasColor) 读回字色=\(backColor) 读回高亮=\(backHl)")
+        Self.log("[selftest] 代码块围栏 = 「\(fence)」语言写入=\(langSet)")
+
+        if !toolbarShown { problems.append("选中文字时格式工具栏不出现（用户就没地方选颜色）") }
+        if toolbarBtns < 20 { problems.append("格式工具栏按钮过少（\(toolbarBtns)）") }
+        if !clickRed { problems.append("点颜色按钮没有真的改到文字") }
+        // 这两条才是关键：Markdown 表达不了颜色，很容易编辑器里好看、存盘就没了
+        if !mdHasColor { problems.append("文字颜色没有写进 md（换别的编辑器打开就掉色）") }
+        if !backColor || !backHl { problems.append("颜色读回来丢了（存了个寂寞）") }
+        if !fence.hasPrefix("```") || fence == "```" {
+            problems.append("代码块没有带上语言（json/md/txt 就分不出来了）")
+        }
+        if !langSet { problems.append("代码块语言设置没生效") }
+
+        finish(ok: problems.isEmpty, reason: problems.joined(separator: "; "))
     }
 
     /// C. 图片在编辑器 ↔ md 之间的往返

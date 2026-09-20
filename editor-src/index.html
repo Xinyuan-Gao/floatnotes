@@ -98,6 +98,54 @@
       }
       ::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, 0.55); }
       ::-webkit-scrollbar-track { background: transparent; }
+
+      /* ── 格式工具栏 ──────────────────────────────────────
+         选中文字时浮在选区上方。BlockNote 自带的那个实测不出现，
+         所以自己画一个：块类型、字色、高亮、代码语言都在这里。 */
+      .fn-toolbar {
+        position: fixed;
+        transform: translate(-50%, calc(-100% - 8px));
+        z-index: 50;
+        padding: 6px 8px;
+        border-radius: 9px;
+        background: rgba(38, 38, 42, 0.96);
+        box-shadow: 0 6px 22px rgba(0, 0, 0, 0.30);
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        /* 工具栏可能贴着窗口上沿，别让它顶出可视区 */
+        max-width: calc(100vw - 16px);
+        flex-wrap: wrap;
+      }
+      /* 选区太靠上时改成挂在选区下方，否则工具栏会顶出窗口 */
+      .fn-toolbar.below { transform: translate(-50%, 8px); }
+      .fn-tb-row { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
+      .fn-tb-btn {
+        min-width: 22px; height: 22px; padding: 0 5px;
+        border: 0; border-radius: 5px;
+        background: rgba(255, 255, 255, 0.10);
+        color: #f2f2f5;
+        font-size: 11px; font-weight: 600; line-height: 1;
+        cursor: pointer;
+      }
+      .fn-tb-btn:hover { background: rgba(255, 255, 255, 0.24); }
+      .fn-tb-wide { font-weight: 500; }
+      .fn-tb-label {
+        color: rgba(255, 255, 255, 0.60);
+        font-size: 10px; margin: 0 2px 0 4px;
+        font-family: var(--fn-font-family);
+      }
+      .fn-tb-swatch {
+        width: 16px; height: 16px; padding: 0;
+        border: 1px solid rgba(255, 255, 255, 0.30);
+        border-radius: 50%;
+        cursor: pointer;
+      }
+      .fn-tb-swatch:hover { border-color: #fff; transform: scale(1.15); }
+      .fn-tb-sep {
+        width: 1px; height: 14px; margin: 0 3px;
+        background: rgba(255, 255, 255, 0.20);
+      }
     </style>
   </head>
   <body>

@@ -78,6 +78,292 @@ function requestUpload(file) {
 }
 
 // ── 编辑器 ─────────────────────────────────────────────────
+// ── 文字颜色 / 高亮 ──────────────────────────────────────────
+//
+// Markdown 本身表达不了颜色，BlockNote 的 markdown 导出也会把颜色丢掉
+// （实测：设完 textColor 再 blocksToMarkdownLossy，输出里一点颜色信息都没有；
+//  同样的内容 blocksToHTMLLossy 是留得住的）。所以走业界通行做法——
+// 把带色的文字写成**内联 HTML**：
+//
+//   <span style="color:#e03131">重要</span>
+//   <span style="background-color:#ffec99">划重点</span>
+//
+// GitHub、Obsidian、VS Code 的 markdown 预览都认这个写法，
+// 笔记发给别人、换台机器打开也不会掉色。
+//
+// 实现上不去动 BlockNote 的序列化器（改不动，而且容易把结构搞坏），
+// 而是导出前把带色片段换成占位符、导出后把占位符换回 HTML 标签。
+// 结构仍然交给 BlockNote，我们只负责把颜色搬过去。
+
+const TEXT_COLORS = [
+  ["default", "默认"], ["red", "红"], ["orange", "橙"], ["yellow", "黄"],
+  ["green", "绿"], ["blue", "蓝"], ["purple", "紫"], ["pink", "粉"], ["gray", "灰"],
+];
+const HIGHLIGHT_COLORS = [
+  ["default", "无"], ["red", "红"], ["orange", "橙"], ["yellow", "黄"],
+  ["green", "绿"], ["blue", "蓝"], ["purple", "紫"], ["pink", "粉"], ["gray", "灰"],
+];
+
+// BlockNote 的颜色是「名字」，别的编辑器只认具体色值，这里做一层映射。
+// 用的是它自己那套配色，肉眼观感一致。
+const COLOR_HEX = {
+  red: "#e03131", orange: "#f08c00", yellow: "#f2c037", green: "#2f9e44",
+  blue: "#1971c2", purple: "#9c36b5", pink: "#e64980", gray: "#868e96",
+};
+const HIGHLIGHT_HEX = {
+  red: "#ffc9c9", orange: "#ffd8a8", yellow: "#ffec99", green: "#b2f2bb",
+  blue: "#a5d8ff", purple: "#eebefa", pink: "#fcc2d7", gray: "#e9ecef",
+};
+
+const TOKEN_RE = /FNCOLORTOKEN(\d+)Z/g;
+// 判断用：不能带 /g，否则 test() 会移动 lastIndex，下一次就漏判
+const TOKEN_TEST = /FNCOLORTOKEN\d+Z/;
+
+function hexToName(hex, table) {
+  if (!hex) return null;
+  const h = String(hex).trim().toLowerCase();
+  for (const [name, value] of Object.entries(table)) {
+    if (value.toLowerCase() === h) return name;
+  }
+  // 认不出的色值：BlockNote 只接受它自己那几个名字，只能退回默认
+  log("颜色 " + hex + " 不在支持列表里，已忽略");
+  return null;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/// 导出前：把带色文字换成占位符，返回 [副本, 记录表]
+function withColorTokens(doc) {
+  const store = [];
+  const clone = JSON.parse(JSON.stringify(doc));
+  const walk = (blocks) => {
+    for (const b of blocks || []) {
+      if (Array.isArray(b.content)) {
+        for (const ic of b.content) {
+          if (ic.type !== "text" || !ic.styles) continue;
+          const tc = ic.styles.textColor && ic.styles.textColor !== "default"
+            ? ic.styles.textColor : null;
+          const bg = ic.styles.backgroundColor && ic.styles.backgroundColor !== "default"
+            ? ic.styles.backgroundColor : null;
+          if (!tc && !bg) continue;
+          store.push({ text: ic.text, textColor: tc, backgroundColor: bg });
+          // 只摘掉颜色，粗体/斜体这些还要留给 BlockNote 去序列化
+          delete ic.styles.textColor;
+          delete ic.styles.backgroundColor;
+          ic.text = "FNCOLORTOKEN" + (store.length - 1) + "Z";
+        }
+      }
+      walk(b.children);
+    }
+  };
+  walk(clone);
+  return [clone, store];
+}
+
+/// 导出后：把占位符换成内联 HTML
+function expandColorTokens(md, store) {
+  return md.replace(TOKEN_RE, (_, n) => {
+    const e = store[Number(n)];
+    if (!e) return "";
+    const css = [];
+    if (e.textColor) css.push("color:" + (COLOR_HEX[e.textColor] || e.textColor));
+    if (e.backgroundColor) {
+      css.push("background-color:" + (HIGHLIGHT_HEX[e.backgroundColor] || e.backgroundColor));
+    }
+    // 不嵌套两层标签：一个 span 同时带前景和背景，导入时正则也好解析
+    return '<span style="' + css.join(";") + '">' + escapeHtml(e.text) + "</span>";
+  });
+}
+
+/// 导入前：把内联 HTML 换回占位符
+function extractColorTokens(md) {
+  const store = [];
+  const out = String(md).replace(
+    /<span style="([^"]*)">([\s\S]*?)<\/span>/g,
+    (whole, css, text) => {
+      const fg = /(?:^|;)\s*color:\s*([^;]+)/.exec(css)?.[1];
+      const bg = /background-color:\s*([^;]+)/.exec(css)?.[1];
+      const textColor = hexToName(fg, COLOR_HEX);
+      const backgroundColor = hexToName(bg, HIGHLIGHT_HEX);
+      if (!textColor && !backgroundColor) return text;   // 认不出就只留文字
+      store.push({ text, textColor, backgroundColor });
+      return "FNCOLORTOKEN" + (store.length - 1) + "Z";
+    }
+  );
+  return [out, store];
+}
+
+/// 载入之后：把正文里的占位符拆成「真文字 + 颜色样式」
+function splitTokenContent(content, store) {
+  const out = [];
+  for (const ic of content || []) {
+    if (ic.type !== "text" || !ic.text || !TOKEN_TEST.test(ic.text)) {
+      out.push(ic);
+      continue;
+    }
+    TOKEN_RE.lastIndex = 0;
+    let last = 0, m;
+    while ((m = TOKEN_RE.exec(ic.text))) {
+      if (m.index > last) {
+        out.push({ type: "text", text: ic.text.slice(last, m.index), styles: { ...ic.styles } });
+      }
+      const e = store[Number(m[1])];
+      const styles = { ...ic.styles };
+      if (e?.textColor) styles.textColor = e.textColor;
+      if (e?.backgroundColor) styles.backgroundColor = e.backgroundColor;
+      out.push({ type: "text", text: e ? e.text : "", styles });
+      last = m.index + m[0].length;
+    }
+    if (last < ic.text.length) {
+      out.push({ type: "text", text: ic.text.slice(last), styles: { ...ic.styles } });
+    }
+  }
+  return out;
+}
+
+/// 载入之后：把含占位符的块改写成「真文字 + 颜色样式」。
+/// 必须整块换 content，而不是改文字 —— 占位符会被拆成多段，
+/// 每段的样式（粗体等）要继承原来的，颜色只加在对应的那一段上。
+function applyColorTokens(editor, store) {
+  const fix = (blocks) => {
+    for (const b of blocks || []) {
+      if (Array.isArray(b.content) &&
+          b.content.some((ic) => ic.type === "text" && ic.text && TOKEN_TEST.test(ic.text))) {
+        editor.updateBlock(b.id, { content: splitTokenContent(b.content, store) });
+      }
+      fix(b.children);
+    }
+  };
+  fix(editor.document);
+}
+
+// ── 格式工具栏 ───────────────────────────────────────────────//
+// 自带一个，而不是用 BlockNote 默认的那个：实测默认工具栏在选中文字时
+// **根本没有出现在 DOM 里**（toolbarFound=false），用户因此完全没地方选颜色。
+// 自己画还有一个好处：块类型和颜色能放在同一处，不用去翻斜杠菜单。
+
+const BLOCK_KINDS = [
+  ["paragraph", "正文"],
+  ["heading", "标题 1", { level: 1 }],
+  ["heading", "标题 2", { level: 2 }],
+  ["heading", "标题 3", { level: 3 }],
+  ["quote", "引用"],
+  ["codeBlock", "代码块"],
+];
+
+// 代码块语言。markdown 的 ```json 围栏本来就带语言，是原生支持的。
+const CODE_LANGS = ["text", "json", "markdown", "javascript", "typescript",
+                    "python", "bash", "sql", "yaml", "xml", "css", "go", "rust", "java"];
+
+function FnFormatToolbar({ editor }) {
+  const [pos, setPos] = useState(null);
+  const [active, setActive] = useState({});
+
+  useEffect(() => {
+    const update = () => {
+      const sel = window.getSelection();
+      const root = document.querySelector(".bn-editor");
+      if (!sel || sel.isCollapsed || !sel.rangeCount || !root) {
+        setPos(null);
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      if (!root.contains(range.commonAncestorContainer)) {
+        setPos(null);
+        return;
+      }
+      const r = range.getBoundingClientRect();
+      if (!r.width && !r.height) {
+        setPos(null);
+        return;
+      }
+      // 笔记窗口很小，工具栏默认浮在选区上方 ——
+      // 选区靠上时会顶出可视区，那时改成挂在下方；左右也要夹回窗口内
+      const below = r.top < 140;
+      const half = 210;
+      const x = Math.min(Math.max(r.left + r.width / 2, half), window.innerWidth - half);
+      setPos({ x, y: below ? r.bottom : r.top, below });
+      try {
+        setActive(editor.getActiveStyles() || {});
+      } catch (e) {
+        setActive({});
+      }
+    };
+    document.addEventListener("selectionchange", update);
+    return () => document.removeEventListener("selectionchange", update);
+  }, [editor]);
+
+  if (!pos) return null;
+
+  // 按住不放会清掉选区，工具栏就没了 —— preventDefault 保住选中状态
+  const hold = (fn) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    fn();
+  };
+  const style = (s) => hold(() => editor.toggleStyles({ [s]: true }));
+  const setColor = (key, value) => hold(() => editor.addStyles({ [key]: value }));
+  const setBlock = (kind, props) => hold(() => {
+    const b = editor.getTextCursorPosition?.()?.block;
+    if (b) editor.updateBlock(b, { type: kind, props: { ...(props || {}) } });
+  });
+
+  const Btn = ({ on, label, title }) => (
+    <button
+      className={"fn-tb-btn" + (on ? " on" : "")}
+      onMouseDown={on === undefined ? undefined : undefined}
+      onClick={on}
+      title={title || label}
+    >{label}</button>
+  );
+
+  return (
+    <div className={"fn-toolbar" + (pos.below ? " below" : "")}
+         style={{ left: pos.x, top: pos.y }}
+         onMouseDown={(e) => e.preventDefault()}>
+      <div className="fn-tb-row">
+        <Btn on={style("bold")} label="B" title="粗体" />
+        <Btn on={style("italic")} label="I" title="斜体" />
+        <Btn on={style("underline")} label="U" title="下划线" />
+        <Btn on={style("strike")} label="S" title="删除线" />
+        <Btn on={style("code")} label="&lt;/&gt;" title="行内代码" />
+        <span className="fn-tb-sep" />
+        {BLOCK_KINDS.map(([kind, label, props]) => (
+          <button key={label} className="fn-tb-btn fn-tb-wide"
+                  onClick={setBlock(kind, props)} title={"转为" + label}>{label}</button>
+        ))}
+      </div>
+      <div className="fn-tb-row">
+        <span className="fn-tb-label">字色</span>
+        {TEXT_COLORS.map(([name, label]) => (
+          <button key={"fg" + name} className="fn-tb-swatch" title={"文字" + label}
+                  style={{ background: COLOR_HEX[name] || "transparent" }}
+                  onClick={setColor("textColor", name)} />
+        ))}
+        <span className="fn-tb-sep" />
+        <span className="fn-tb-label">高亮</span>
+        {HIGHLIGHT_COLORS.map(([name, label]) => (
+          <button key={"bg" + name} className="fn-tb-swatch" title={"高亮" + label}
+                  style={{ background: HIGHLIGHT_HEX[name] || "transparent" }}
+                  onClick={setColor("backgroundColor", name)} />
+        ))}
+      </div>
+      <div className="fn-tb-row">
+        <span className="fn-tb-label">代码语言</span>
+        {CODE_LANGS.map((l) => (
+          <button key={l} className="fn-tb-btn" title={"代码块语言 " + l}
+                  onClick={hold(() => {
+                    const b = editor.getTextCursorPosition?.()?.block;
+                    if (b) editor.updateBlock(b, { type: "codeBlock", props: { language: l } });
+                  })}>{l}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [systemDark, setSystemDark] = useState(prefersDark);
   // "auto" | "light" | "dark" —— Swift 可以通过 window.FloatNotes.setTheme() 覆盖
@@ -113,10 +399,15 @@ function App() {
       async load(markdown) {
         if (!markdown || !markdown.trim()) return;
         try {
-          const blocks = await editor.tryParseMarkdownToBlocks(markdown);
+          // 先把内联 HTML 颜色换成占位符，让 BlockNote 正常解析结构；
+          // 载入完成后再把占位符拆回「真文字 + 颜色样式」
+          const [withTokens, store] = extractColorTokens(markdown);
+          const blocks = await editor.tryParseMarkdownToBlocks(withTokens);
           if (blocks?.length) {
             editor.replaceBlocks(editor.document, blocks);
-            log("已载入 " + blocks.length + " 个块");
+            if (store.length) applyColorTokens(editor, store);
+            log("已载入 " + blocks.length + " 个块"
+                + (store.length ? "（含 " + store.length + " 处颜色）" : ""));
           }
         } catch (e) {
           log("载入失败: " + e);
@@ -230,8 +521,11 @@ function App() {
         window.__fnMd = { done: false, value: null };
         (async () => {
           try {
-            const v = await editor.blocksToMarkdownLossy(editor.document);
-            window.__fnMd = { done: true, value: v || "" };
+            // 先把带色片段换成占位符再交给 BlockNote 序列化，
+            // 拿回来再把占位符展开成内联 HTML —— 这样颜色才进得了 .md
+            const [doc, store] = withColorTokens(editor.document);
+            const raw = await editor.blocksToMarkdownLossy(doc);
+            window.__fnMd = { done: true, value: expandColorTokens(raw || "", store) };
           } catch (e) {
             window.__fnMd = { done: true, value: "ERR " + e };
           }
@@ -316,6 +610,153 @@ function App() {
       async status() {
         const md = await editor.blocksToMarkdownLossy(editor.document);
         return { blocks: editor.document.length, markdownLength: md.length };
+      },
+
+      // 自检用：把编辑器的「能力清单」原样报出来 ——
+      // 有哪些块类型、哪些内联样式、格式工具栏上实际有哪些按钮、
+      // 以及设了文字颜色之后 markdown 里还留不留得住。
+      // 光读 BlockNote 的类型定义没用，得看真实 DOM 和真实导出结果。
+      async _editorProbe() {
+        const out = {};
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+        try {
+          out.blockTypes = Object.keys(editor.schema.blockSpecs || {});
+          out.styleSpecs = Object.keys(editor.schema.styleSpecs || {});
+          const cb = editor.schema.blockSpecs?.codeBlock;
+          out.codeBlockLanguageValues =
+            cb?.config?.propSchema?.language?.values ?? null;
+
+          // 选中一段真实文字，看格式工具栏冒出来什么
+          const pm = editor._tiptapEditor || editor.prosemirrorEditor;
+          let from = null, to = null;
+          pm.state.doc.descendants((node, pos) => {
+            if (from === null && node.isText && node.text.trim().length > 3) {
+              from = pos;
+              to = pos + Math.min(6, node.text.length);
+            }
+            return true;
+          });
+          out.selectionMade = from !== null;
+          if (from !== null) {
+            pm.commands.setTextSelection({ from, to });
+            await wait(500);
+            // 自带工具栏（实测不出现，记下来做对比）
+            out.bnToolbarFound = !!(
+              document.querySelector(".bn-formatting-toolbar") ||
+              document.querySelector('[class*="formatting-toolbar"]')
+            );
+            // 我们自己的工具栏：选中之后应该出现
+            let mine = document.querySelector(".fn-toolbar");
+            out.ourToolbarShownOnSelection = !!mine;
+            out.ourToolbarButtons = mine ? mine.querySelectorAll("button").length : 0;
+
+            // 工具栏要用到的 API 在 0.39 里是否真的存在
+            out.api = {
+              addStyles: typeof editor.addStyles,
+              toggleStyles: typeof editor.toggleStyles,
+              getActiveStyles: typeof editor.getActiveStyles,
+              getTextCursorPosition: typeof editor.getTextCursorPosition,
+              updateBlock: typeof editor.updateBlock,
+            };
+
+            // 用 DOM Range 再选一次 —— 真人拖选就是这个路径，
+            // 上面 PM 命令不一定触发 selectionchange
+            try {
+              const textNode = document.querySelector(".bn-editor [data-content-type] .bn-inline-content")
+                ?.firstChild;
+              if (textNode && textNode.nodeType === 3) {
+                const r = document.createRange();
+                r.setStart(textNode, 0);
+                r.setEnd(textNode, Math.min(4, textNode.length));
+                const ds = window.getSelection();
+                ds.removeAllRanges();
+                ds.addRange(r);
+                document.dispatchEvent(new Event("selectionchange"));
+                await wait(300);
+                mine = document.querySelector(".fn-toolbar");
+                out.ourToolbarShownOnDomSelection = !!mine;
+                out.ourToolbarButtons = mine ? mine.querySelectorAll("button").length : 0;
+
+                // 真的点一下色块，看颜色有没有落到文档上 ——
+                // 光看工具栏出现还不够，按钮接没接对才是关键
+                const swatches = mine ? [...mine.querySelectorAll(".fn-tb-swatch")] : [];
+                out.swatchCount = swatches.length;
+                if (swatches.length > 1) {
+                  swatches[1].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+                  await wait(400);
+                  out.clickRedApplied = JSON.stringify(editor.document).includes('"textColor":"red"');
+                }
+                // 再点一下「高亮」那一排的第一个色块
+                if (swatches.length > 9) {
+                  const before = JSON.stringify(editor.document);
+                  swatches[9].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+                  await wait(400);
+                  out.clickHighlightChanged = JSON.stringify(editor.document) !== before;
+                }
+              }
+            } catch (e) {
+              out.domSelectionError = String(e);
+            }
+          }
+
+          // 颜色进出 md 的完整往返：设色 → 导出 → 看 md 里有没有 → 再载回来 → 看还在不在
+          try {
+            const first = editor.document.find(
+              (b) => Array.isArray(b.content) && b.content.some((c) => c.type === "text")
+            );
+            const ic = first.content.find((c) => c.type === "text" && c.text.trim());
+            const half = Math.max(1, Math.floor(ic.text.length / 2));
+            const content = first.content.map((c) => {
+              if (c !== ic) return c;
+              return [
+                { type: "text", text: c.text.slice(0, half), styles: { ...c.styles } },
+                { type: "text", text: c.text.slice(half), styles: { ...c.styles, textColor: "red", backgroundColor: "yellow" } },
+              ];
+            }).flat();
+            editor.updateBlock(first.id, { content });
+            await wait(300);
+
+            const [doc, store] = withColorTokens(editor.document);
+            const raw = await editor.blocksToMarkdownLossy(doc);
+            const md = expandColorTokens(raw, store);
+            out.colorRoundTripTokenCount = store.length;
+            out.mdHasColorHtml = /<span style="color:#e03131/.test(md);
+            out.mdColorSample = (md.match(/<span[^>]*>[^<]*<\/span>/) || [""])[0];
+
+            // 再走一遍导入
+            const [back, store2] = extractColorTokens(md);
+            out.reimportTokenCount = store2.length;
+            const blocks = await editor.tryParseMarkdownToBlocks(back);
+            editor.replaceBlocks(editor.document, blocks);
+            if (store2.length) applyColorTokens(editor, store2);
+            await wait(300);
+            const hasRed = JSON.stringify(editor.document).includes('"textColor":"red"');
+            const hasYellow = JSON.stringify(editor.document).includes('"backgroundColor":"yellow"');
+            out.reimportRestoredColor = hasRed;
+            out.reimportRestoredHighlight = hasYellow;
+          } catch (e) {
+            out.colorRoundTripError = String(e);
+          }
+
+          // 代码块语言能不能设上、md 围栏里带不带
+          try {
+            const b = editor.document[editor.document.length - 1];
+            editor.updateBlock(b.id, { type: "codeBlock", props: { language: "json" } });
+            await wait(250);
+            const [d2, s2] = withColorTokens(editor.document);
+            const md2 = expandColorTokens(await editor.blocksToMarkdownLossy(d2), s2);
+            out.codeFence = (md2.match(/```[a-zA-Z]*/) || [""])[0];
+            out.codeLangSet = JSON.stringify(editor.document).includes('"language":"json"');
+          } catch (e) {
+            out.codeLangError = String(e);
+          }
+        } catch (e) {
+          out.error = String(e);
+        }
+        // 异步结果只能靠全局变量传出去 ——
+        // 这个 SDK 里 callAsyncJavaScript 是坏的（返回空），只能 evaluateJavaScript + 轮询
+        window.__fnEditorProbe = JSON.stringify(out);
+        return window.__fnEditorProbe;
       },
 
       // 自检：跑一遍图片粘贴的完整链路
@@ -486,6 +927,7 @@ function App() {
         theme={dark ? "dark" : "light"}
         onChange={emitChange}
       />
+      <FnFormatToolbar editor={editor} />
     </div>
   );
 }
