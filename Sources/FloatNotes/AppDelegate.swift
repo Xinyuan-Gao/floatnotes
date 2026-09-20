@@ -2074,6 +2074,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 注意 Info.plist 里 LSUIElement=true，默认是 .accessory 策略，
         // 那种状态下 activate 是无效的，必须先切到 .regular。
         ensureFrontmost()
+        startFrontmostWatchdog()
 
         baselineMB = Perf.residentMemoryMB()
         Self.log(String(format: "[selftest] 基线内存 %.1f MB", baselineMB))
@@ -2120,6 +2121,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: poll)
         }
         poll()
+    }
+
+    /// 自检期间一直盯着前台，被抢走就抢回来。
+    ///
+    /// 只在开头激活一次是不够的：用户中途切到别的窗口、或别的程序抢焦点，
+    /// 本 App 就变成 isActive=false、**没有 key window**，
+    /// 而 NSApp.sendAction(to: nil) 在没有 key window 时是静默什么都不做的 ——
+    /// 表现出来就是 ⌘C/⌘V/滚轮「随机失效」，看着像产品坏了。
+    /// 实测诊断：选区委实选好了（sel=90），但 isActive=false、key=无。
+    private var frontmostWatchdog: Timer?
+
+    private func startFrontmostWatchdog() {
+        frontmostWatchdog?.invalidate()
+        frontmostWatchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            guard !NSApp.isActive else { return }
+            Self.log("[selftest] 前台被抢走，抢回来（需要真实系统事件的检查依赖它）")
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     private func stage2() {
@@ -3085,9 +3105,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             NSApp.sendAction(Selector(("paste:")), to: nil, from: nil)
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            // ★ 轮询等粘贴生效，不再赌固定秒数。
+            //   WebKit 的剪贴板操作是异步的，而且**重新构建后的第一次运行特别慢**
+            //   （冷启动，WebKit 和剪贴板服务都要初始化）。实测固定等 1.6 秒时，
+            //   每次刚构建完的第一轮必失败、之后就正常 —— 这种「首轮必红」的测试
+            //   最容易被当成噪声忽略掉。
+            let pasteDeadline = Date().addingTimeInterval(6.0)
+            func pollPaste() {
                 editor.evaluate("document.querySelector('.tiptap, .bn-editor, .ProseMirror')?.innerText || ''") { text in
                     let body = (text as? String) ?? ""
+                    if !body.contains(token), Date() < pasteDeadline {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: pollPaste)
+                        return
+                    }
                     let ok = body.contains(token)
                     Self.log("[selftest] 粘贴结果：编辑器\(ok ? "已收到" : "没收到")「\(token)」")
                     if !ok { self.problems.append("⌘V 粘贴没有进入编辑器") }
@@ -3141,6 +3171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                 }
             }
+            pollPaste()
         }
     }
 
@@ -3910,6 +3941,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func finish(ok: Bool, reason: String) {
         guard !finished else { return }
         finished = true
+
+        // 别再抢用户的前台了，自检结束就把看门狗关掉
+        frontmostWatchdog?.invalidate()
+        frontmostWatchdog = nil
 
         // 无论走哪条路（成功 / 断言失败 / 超时）都要把用户设置还原、把测试笔记删掉
         restoreSettings()
